@@ -204,15 +204,15 @@ def check_opportunity(data, name, sell, buy):
             purchase_price = float(get_purchasing_price(name))
             # FIX 4: trailing stop — sell if price dropped >2% from the session peak MA
             peak_ma = max(data['close']) if data['close'] else purchase_price
-            if price >= (purchase_price * 1.03):
-                print('Taking profit (+3%)')
+            if price >= (purchase_price * 1.05):
+                print('Taking profit (+5%)')
                 return True
-            # stop-loss at 1% — guarantees 3:1 reward/risk ratio per trade
+            # stop-loss at 1% — guarantees 5:1 reward/risk ratio per trade
             if price < purchase_price * 0.99:
                 print('Stop-loss triggered (-1%)')
                 return True
-            if price < peak_ma * 0.98:
-                print('Trailing stop triggered (-2% from peak MA)')
+            if price < peak_ma * 0.99:
+                print('Trailing stop triggered (-1% from peak MA)')
                 return True
         areas.append(mva / price)
 
@@ -224,7 +224,7 @@ def check_opportunity(data, name, sell, buy):
             # FIX 3: use correct average (divide by len(areas), not hardcoded 3)
             # Buy when price is not more than ~5% above recent MA (avoids buying overbought)
             # avg_MA / price >= 0.95  ↔  price <= avg_MA * 1.053
-            if len(areas) > 0 and counter / len(areas) >= 0.95:
+            if len(areas) > 0 and counter / len(areas) >= 0.93:
                 return True
 
         return False

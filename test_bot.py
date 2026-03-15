@@ -183,29 +183,29 @@ class TestCheckOpportunity(unittest.TestCase):
         self.assertFalse(result)
 
     def test_buy_signal_on_uptrend_with_price_near_ma(self):
-        # MA values trending up AND current price close to MA (within ~5%) → buy
+        # MA values trending up AND current price close to MA (within ~7%) → buy
         close_prices = [95.0 + i * 0.5 for i in range(15)]  # MA ~102
-        data = self._make_data(close_prices, 103.0)  # price within 5% of MA
+        data = self._make_data(close_prices, 103.0)  # price within 7% of MA
         result = bot.check_opportunity(data, 'XETHZUSD', sell=False, buy=True)
         self.assertTrue(result)
 
     def test_no_buy_signal_on_uptrend_price_overbought(self):
-        # MA trending up but current price is >5% above MA → overbought, don't buy
+        # MA trending up but current price is >7% above MA → overbought, don't buy
         close_prices = [95.0 + i * 0.5 for i in range(15)]  # MA ~102
         data = self._make_data(close_prices, 115.0)  # price >12% above MA
         result = bot.check_opportunity(data, 'XETHZUSD', sell=False, buy=True)
         self.assertFalse(result)
 
-    def test_sell_triggers_above_3_percent_profit(self):
-        # take-profit at +3%
-        data = self._make_data([100.0] * 15, 104.0)
+    def test_sell_triggers_above_5_percent_profit(self):
+        # take-profit at +5%
+        data = self._make_data([100.0] * 15, 106.0)
         with patch('bot.get_purchasing_price', return_value=100.0):
             result = bot.check_opportunity(data, 'XETHZUSD', sell=True, buy=False)
         self.assertTrue(result)
 
-    def test_sell_does_not_trigger_below_3_percent_profit(self):
-        # price only 2% above purchase — below the 3% take-profit threshold
-        data = self._make_data([100.0] * 15, 102.0)
+    def test_sell_does_not_trigger_below_5_percent_profit(self):
+        # price only 3% above purchase — below the 5% take-profit threshold
+        data = self._make_data([100.0] * 15, 103.0)
         with patch('bot.get_purchasing_price', return_value=100.0):
             result = bot.check_opportunity(data, 'XETHZUSD', sell=True, buy=False)
         self.assertIsNone(result)
@@ -225,9 +225,9 @@ class TestCheckOpportunity(unittest.TestCase):
         self.assertIsNone(result)
 
     def test_trailing_stop_triggers_on_drop_from_peak_ma(self):
-        # Peak MA was 110, current price dropped to 107 (< 110 * 0.98 = 107.8)
+        # Peak MA was 110, current price dropped to 108 (< 110 * 0.99 = 108.9)
         close_prices = [105.0 + i for i in range(6)] + [110.0] * 9  # peak MA = 110
-        data = self._make_data(close_prices, 107.0)
+        data = self._make_data(close_prices, 108.0)
         with patch('bot.get_purchasing_price', return_value=100.0):
             result = bot.check_opportunity(data, 'XETHZUSD', sell=True, buy=False)
         self.assertTrue(result)
