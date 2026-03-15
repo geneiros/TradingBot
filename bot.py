@@ -3,8 +3,6 @@ import time
 import decimal
 import json
 
-from numpy import identity
-
 def now():
     return decimal.Decimal(time.time())
 
@@ -12,11 +10,9 @@ def get_balance():
     with open('balance.json', 'r') as f:
         try:
             return json.load(f)
-        except:
-        # change this for the actual query to the database once the scrip is working
+        except Exception:
+            # change this for the actual query to the database once the scrip is working
             return {'ZUSD': '1000.0', 'EUR.HOLD': '0.000'}
-        print(k.query_private('Balance')['result'])
-        #return k.query_private('Balance')['result']
 
 def update_balance(amount, name, price, sold):
     balance = get_balance()
@@ -39,15 +35,15 @@ def get_crypto_data(pair, since):
 
 def get_purchasing_price(name):
     trades = load_trades()
-    return trades(name)[-1]['price_usd']
+    return trades[name][-1]['price_usd']
 
 def load_trades():
     trades = {}
     with open('trades.json', 'r') as f:
         try:
             trades = json.load(f)
-        except:
-            for crypto in pairs:
+        except Exception:
+            for crypto in get_pairs():
                 trades[crypto] = []
     return trades
 
