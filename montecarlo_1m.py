@@ -12,10 +12,10 @@ import sys
 from multiprocessing import Pool, cpu_count
 
 # ── Strategy (mirrors bot.py) ─────────────────────────────────────────────────
-TAKE_PROFIT    = 1.03
+TAKE_PROFIT    = 1.05
 STOP_LOSS      = 0.99
-TRAILING_STOP  = 0.98
-MA_THRESHOLD   = 0.95
+TRAILING_STOP  = 0.99
+MA_THRESHOLD   = 0.93
 MA_UPTREND_MIN = 5
 
 # ── Simulation config ─────────────────────────────────────────────────────────
