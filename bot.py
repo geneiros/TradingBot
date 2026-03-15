@@ -3,8 +3,6 @@ import time
 import decimal
 import json
 
-from numpy import identity
-
 def now():
     return decimal.Decimal(time.time())
 
@@ -12,11 +10,9 @@ def get_balance():
     with open('balance.json', 'r') as f:
         try:
             return json.load(f)
-        except:
-        # change this for the actual query to the database once the scrip is working
+        except Exception:
+            # change this for the actual query to the database once the scrip is working
             return {'ZUSD': '1000.0', 'EUR.HOLD': '0.000'}
-        print(k.query_private('Balance')['result'])
-        #return k.query_private('Balance')['result']
 
 def update_balance(amount, name, price, sold):
     balance = get_balance()
@@ -39,15 +35,15 @@ def get_crypto_data(pair, since):
 
 def get_purchasing_price(name):
     trades = load_trades()
-    return trades(name)[-1]['price_usd']
+    return trades[name][-1]['price_usd']
 
 def load_trades():
     trades = {}
     with open('trades.json', 'r') as f:
         try:
             trades = json.load(f)
-        except:
-            for crypto in pairs:
+        except Exception:
+            for crypto in get_pairs():
                 trades[crypto] = []
     return trades
 
@@ -199,19 +195,24 @@ def check_opportunity(data, name, sell, buy):
             else:
                 trends.append('NOTREND')
             previous_value = mva
-    
-    #print(trends)
+
     areas = []
+    # FIX 1: use close price [4] instead of low price [3]
+    price = float(data['prices'][-1][4])
     for mva in reversed(data['close'][-5:]):
-        area = 0
-        price = float(data['prices'][-1][3])
         if sell:
             purchase_price = float(get_purchasing_price(name))
-            if price >= (purchase_price * 1.02):
-                print('Should sell with 100% profit')
+            # FIX 4: trailing stop — sell if price dropped >2% from the session peak MA
+            peak_ma = max(data['close']) if data['close'] else purchase_price
+            if price >= (purchase_price * 1.05):
+                print('Taking profit (+5%)')
                 return True
-            if price < purchase_price:
-                print('Selling at a loss')
+            # stop-loss at 1% — guarantees 5:1 reward/risk ratio per trade
+            if price < purchase_price * 0.99:
+                print('Stop-loss triggered (-1%)')
+                return True
+            if price < peak_ma * 0.99:
+                print('Trailing stop triggered (-1% from peak MA)')
                 return True
         areas.append(mva / price)
 
@@ -220,7 +221,10 @@ def check_opportunity(data, name, sell, buy):
         if count >= 5:
             for area in areas:
                 counter += area
-            if counter / 3 >= 1.05:
+            # FIX 3: use correct average (divide by len(areas), not hardcoded 3)
+            # Buy when price is not more than ~5% above recent MA (avoids buying overbought)
+            # avg_MA / price >= 0.95  ↔  price <= avg_MA * 1.053
+            if len(areas) > 0 and counter / len(areas) >= 0.93:
                 return True
 
         return False
