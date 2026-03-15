@@ -21,7 +21,7 @@ MA_UPTREND_MIN = 5
 # ── Simulation config ─────────────────────────────────────────────────────────
 NUM_SIMULATIONS = 1_000_000
 NUM_CYCLES      = 20
-INITIAL_USD     = 1_000.0
+INITIAL_USD     = 100.0
 NUM_PAIRS       = 6
 BATCH_SIZE      = 2_000          # simulations per worker batch
 
