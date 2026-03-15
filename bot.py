@@ -5,6 +5,20 @@ import json
 
 k = None  # set in __main__
 
+# OHLC candle field indices
+_OHLC_HIGH = 2
+_OHLC_LOW = 3
+_OHLC_CLOSE = 4
+
+# Trading thresholds
+_PROFIT_TARGET = 1.05   # take profit at +5%
+_STOP_LOSS = 0.99       # stop-loss at -1%
+_TRAILING_STOP = 0.99   # trailing stop: -1% from peak MA
+_WINDOW_SECONDS = 43200  # 12-hour rolling window
+_MAX_MA_HISTORY = 200   # cap for MA lists
+
+_PAIRS = ('XETHZUSD', 'XXBTZUSD', 'MANAUSD', 'GRTUSD', 'LSKUSD', 'SCUSD')
+
 
 def now():
     return decimal.Decimal(time.time())
@@ -40,8 +54,8 @@ def load_trades():
         with open('trades.json', 'r') as f:
             trades = json.load(f)
     except Exception:
-        for crypto in get_pairs():
-            trades[crypto] = []
+        for pair in _PAIRS:
+            trades[pair] = []
     return trades
 
 
@@ -62,7 +76,7 @@ def load_crypto_data_from_file():
 
 
 def make_crypto_data(data):
-    for name in get_pairs():
+    for name in _PAIRS:
         data[name] = {
             'high': [],
             'low': [],
@@ -88,30 +102,36 @@ def save_trade(close, name, bought, sold, amount):
         json.dump(trades, f, indent=4)
 
 
+def _place_order(pair, order_type, volume):
+    """Place a market order. Returns True on success, False on API error."""
+    resp = k.query_private('AddOrder', {
+        'pair': pair,
+        'type': order_type,
+        'ordertype': 'market',
+        'volume': f'{volume:.8f}',
+    })
+    if resp.get('error'):
+        print(f'{order_type.capitalize()} order error for {pair}: {resp["error"]}')
+        return False
+    print(f'{order_type.capitalize()} order placed for {pair}: {resp["result"]}')
+    return True
+
+
 def buy_crypto(crypto_data, name):
     clear_crypto_data(name)
-    price = float(crypto_data[-1][4])
+    price = float(crypto_data[-1][_OHLC_CLOSE])
     funds = get_available_funds()
     if funds <= 0:
         print(f'No funds available to buy {name}')
         return
     amount = funds / price
-    resp = k.query_private('AddOrder', {
-        'pair': name,
-        'type': 'buy',
-        'ordertype': 'market',
-        'volume': f'{amount:.8f}',
-    })
-    if resp.get('error'):
-        print(f'Buy order error for {name}: {resp["error"]}')
-        return
-    print(f'Buy order placed for {name}: {resp["result"]}')
-    save_trade(price, name, True, False, amount)
+    if _place_order(name, 'buy', amount):
+        save_trade(price, name, True, False, amount)
 
 
 def sell_crypto(crypto_data, name):
     clear_crypto_data(name)
-    price = float(crypto_data[-1][4])
+    price = float(crypto_data[-1][_OHLC_CLOSE])
     # Get amount from last buy trade (avoids Kraken balance key naming issues)
     trades = load_trades()
     last_buy = next((t for t in reversed(trades[name]) if t['bought']), None)
@@ -119,32 +139,20 @@ def sell_crypto(crypto_data, name):
         print(f'No buy trade found for {name}, cannot sell')
         return
     amount = float(last_buy['amount'])
-    resp = k.query_private('AddOrder', {
-        'pair': name,
-        'type': 'sell',
-        'ordertype': 'market',
-        'volume': f'{amount:.8f}',
-    })
-    if resp.get('error'):
-        print(f'Sell order error for {name}: {resp["error"]}')
-        return
-    print(f'Sell order placed for {name}: {resp["result"]}')
-    save_trade(price, name, False, True, amount)
+    if _place_order(name, 'sell', amount):
+        save_trade(price, name, False, True, amount)
 
 
 def clear_crypto_data(name):
     data = load_crypto_data_from_file()
     for key in data[name]:
-        data[name][key] = delete_entries(data[name], key)
+        data[name][key] = data[name][key][-10:]
     save_crypto_data(data)
     return data
 
 
 def delete_entries(data, key):
-    clean_array = []
-    for entry in data[key][-10:]:
-        clean_array.append(entry)
-    return clean_array
+    return data[key][-10:]
 
 
 def get_available_funds():
@@ -153,10 +161,10 @@ def get_available_funds():
     # Count how many of our pairs are currently held (have an open buy)
     trades = load_trades()
     pairs_held = sum(
-        1 for pair in get_pairs()
+        1 for pair in _PAIRS
         if trades[pair] and trades[pair][-1]['bought'] and not trades[pair][-1]['sold']
     )
-    slots_free = len(get_pairs()) - pairs_held
+    slots_free = len(_PAIRS) - pairs_held
     if slots_free <= 0:
         return 0.0
     return money / slots_free
@@ -167,10 +175,10 @@ def bot(k_api, pairs):
     k = k_api
     mva = load_crypto_data_from_file()
     while True:
-        since = str(int(time.time() - 43200))  # rolling 12h window each cycle
+        since = str(int(time.time() - _WINDOW_SECONDS))
+        trades = load_trades()  # load once per cycle, shared across all pairs
         for pair in pairs:
             try:
-                trades = load_trades()
                 crypto_data = get_crypto_data(pair, since)
                 last_trade = trades[pair][-1] if trades[pair] else None
                 should_buy = last_trade is None or last_trade['sold']
@@ -188,12 +196,16 @@ def check_data(name, crypto_data, should_buy, mva):
     for b in crypto_data[-100:]:
         if b not in mva[name]['prices']:
             mva[name]['prices'].append(b)
-        high  += float(b[2])
-        low   += float(b[3])
-        close += float(b[4])
+        high  += float(b[_OHLC_HIGH])
+        low   += float(b[_OHLC_LOW])
+        close += float(b[_OHLC_CLOSE])
     mva[name]['high'].append(high / 100)
     mva[name]['low'].append(low / 100)
     mva[name]['close'].append(close / 100)
+    # Cap MA lists to prevent unbounded growth
+    for key in ('high', 'low', 'close'):
+        if len(mva[name][key]) > _MAX_MA_HISTORY:
+            mva[name][key] = mva[name][key][-_MAX_MA_HISTORY:]
     save_crypto_data(mva)
 
     if should_buy:
@@ -234,21 +246,22 @@ def check_opportunity(data, name, sell, buy):
             previous_value = mva
 
     areas = []
-    # FIX 1: use close price [4] instead of low price [3]
-    price = float(data['prices'][-1][4])
+    price = float(data['prices'][-1][_OHLC_CLOSE])
+
+    if sell:
+        purchase_price = float(get_purchasing_price(name))
+        peak_ma = max(data['close']) if data['close'] else purchase_price
+        if price >= purchase_price * _PROFIT_TARGET:
+            print(f'Taking profit (+{int((_PROFIT_TARGET - 1) * 100)}%)')
+            return True
+        if price < purchase_price * _STOP_LOSS:
+            print('Stop-loss triggered (-1%)')
+            return True
+        if price < peak_ma * _TRAILING_STOP:
+            print('Trailing stop triggered (-1% from peak MA)')
+            return True
+
     for mva in reversed(data['close'][-5:]):
-        if sell:
-            purchase_price = float(get_purchasing_price(name))
-            peak_ma = max(data['close']) if data['close'] else purchase_price
-            if price >= (purchase_price * 1.05):
-                print('Taking profit (+5%)')
-                return True
-            if price < purchase_price * 0.99:
-                print('Stop-loss triggered (-1%)')
-                return True
-            if price < peak_ma * 0.99:
-                print('Trailing stop triggered (-1% from peak MA)')
-                return True
         areas.append(mva / price)
 
     if buy:
@@ -269,21 +282,24 @@ def try_sell(data, name, crypto_data):
 
 
 def get_pairs():
-    return ('XETHZUSD', 'XXBTZUSD', 'MANAUSD', 'GRTUSD', 'LSKUSD', 'SCUSD')
+    return _PAIRS
 
 
 def _init_files():
-    import os
-    if not os.path.exists('trades.json'):
-        with open('trades.json', 'w') as f:
-            json.dump({p: [] for p in get_pairs()}, f, indent=4)
-    if not os.path.exists('data.json'):
-        save_crypto_data(make_crypto_data({}))
+    try:
+        with open('trades.json', 'x') as f:
+            json.dump({p: [] for p in _PAIRS}, f, indent=4)
+    except FileExistsError:
+        pass
+    try:
+        with open('data.json', 'x') as f:
+            json.dump(make_crypto_data({}), f, indent=4)
+    except FileExistsError:
+        pass
 
 
 if __name__ == '__main__':
     _init_files()
     k = krakenex.API()
     k.load_key('kraken.key')
-    pairs = get_pairs()
-    bot(k, pairs)
+    bot(k, _PAIRS)
