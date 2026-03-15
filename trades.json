@@ -1,0 +1,56 @@
+{
+    "XETHZUSD": [
+        {
+            "time_stamp": "1643751527",
+            "price_usd": 2795.0,
+            "bought": true,
+            "sold": false,
+            "amount": 0.059630292188431716
+        }
+    ],
+    "XXBTZUSD": [
+        {
+            "time_stamp": "1643751528",
+            "price_usd": 38833.8,
+            "bought": true,
+            "sold": false,
+            "amount": 0.004291793918356346
+        }
+    ],
+    "MANAUSD": [
+        {
+            "time_stamp": "1643751529",
+            "price_usd": 2.70617,
+            "bought": true,
+            "sold": false,
+            "amount": 61.587655862960084
+        }
+    ],
+    "GRTUSD": [
+        {
+            "time_stamp": "1643751530",
+            "price_usd": 0.44244,
+            "bought": true,
+            "sold": false,
+            "amount": 376.6989120935418
+        }
+    ],
+    "LSKUSD": [
+        {
+            "time_stamp": "1643751530",
+            "price_usd": 1.619226,
+            "bought": true,
+            "sold": false,
+            "amount": 102.92983602453683
+        }
+    ],
+    "SCUSD": [
+        {
+            "time_stamp": "1643751530",
+            "price_usd": 0.01016,
+            "bought": true,
+            "sold": false,
+            "amount": 16404.199475065616
+        }
+    ]
+}
