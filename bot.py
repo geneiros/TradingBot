@@ -195,19 +195,24 @@ def check_opportunity(data, name, sell, buy):
             else:
                 trends.append('NOTREND')
             previous_value = mva
-    
-    #print(trends)
+
     areas = []
+    # FIX 1: use close price [4] instead of low price [3]
+    price = float(data['prices'][-1][4])
     for mva in reversed(data['close'][-5:]):
-        area = 0
-        price = float(data['prices'][-1][3])
         if sell:
             purchase_price = float(get_purchasing_price(name))
+            # FIX 4: trailing stop — sell if price dropped >2% from the session peak MA
+            peak_ma = max(data['close']) if data['close'] else purchase_price
             if price >= (purchase_price * 1.02):
-                print('Should sell with 100% profit')
+                print('Taking profit (+2%)')
                 return True
-            if price < purchase_price:
-                print('Selling at a loss')
+            # FIX 2: stop-loss with 3% buffer instead of any loss
+            if price < purchase_price * 0.97:
+                print('Stop-loss triggered (-3%)')
+                return True
+            if price < peak_ma * 0.98:
+                print('Trailing stop triggered (-2% from peak MA)')
                 return True
         areas.append(mva / price)
 
@@ -216,7 +221,10 @@ def check_opportunity(data, name, sell, buy):
         if count >= 5:
             for area in areas:
                 counter += area
-            if counter / 3 >= 1.05:
+            # FIX 3: use correct average (divide by len(areas), not hardcoded 3)
+            # Buy when price is not more than ~5% above recent MA (avoids buying overbought)
+            # avg_MA / price >= 0.95  ↔  price <= avg_MA * 1.053
+            if len(areas) > 0 and counter / len(areas) >= 0.95:
                 return True
 
         return False
