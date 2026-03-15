@@ -10,59 +10,27 @@ import bot
 
 
 class TestGetBalance(unittest.TestCase):
-    def test_returns_balance_from_file(self):
-        mock_data = {'ZUSD': '500.0', 'XETH': '1.5'}
-        with patch('builtins.open', mock_open(read_data=json.dumps(mock_data))):
-            result = bot.get_balance()
-        self.assertEqual(result, mock_data)
+    def setUp(self):
+        bot.k = MagicMock()
 
-    def test_returns_default_on_invalid_json(self):
-        with patch('builtins.open', mock_open(read_data='invalid json')):
-            result = bot.get_balance()
-        self.assertEqual(result['ZUSD'], '1000.0')
-        self.assertIn('EUR.HOLD', result)
+    def test_returns_balance_from_kraken(self):
+        bot.k.query_private.return_value = {
+            'error': [],
+            'result': {'ZUSD': '500.0', 'XETH': '1.5'}
+        }
+        result = bot.get_balance()
+        self.assertEqual(result, {'ZUSD': '500.0', 'XETH': '1.5'})
+        bot.k.query_private.assert_called_once_with('Balance')
 
-    def test_returns_default_on_empty_file(self):
-        with patch('builtins.open', mock_open(read_data='')):
-            result = bot.get_balance()
-        self.assertEqual(result['ZUSD'], '1000.0')
+    def test_returns_empty_on_api_error(self):
+        bot.k.query_private.return_value = {'error': ['EGeneral:Invalid key']}
+        result = bot.get_balance()
+        self.assertEqual(result, {})
 
-
-class TestUpdateBalance(unittest.TestCase):
-    def test_buy_deducts_funds_and_adds_crypto(self):
-        mock_balance = {'ZUSD': '1000.0'}
-        with patch('bot.get_balance', return_value=mock_balance), \
-             patch('bot.save_balance'):
-            result = bot.update_balance(2.0, 'XETHZUSD', 100.0, sold=False)
-        self.assertAlmostEqual(float(result['ZUSD']), 800.0)
-        self.assertEqual(result['XETH'], '2.0')
-
-    def test_sell_adds_funds_and_removes_crypto(self):
-        mock_balance = {'ZUSD': '800.0', 'XETH': '2.0'}
-        with patch('bot.get_balance', return_value=mock_balance), \
-             patch('bot.save_balance'):
-            result = bot.update_balance(2.0, 'XETHZUSD', 100.0, sold=True)
-        self.assertAlmostEqual(float(result['ZUSD']), 1000.0)
-        self.assertNotIn('XETH', result)
-
-    def test_save_balance_called_after_update(self):
-        mock_balance = {'ZUSD': '1000.0'}
-        with patch('bot.get_balance', return_value=mock_balance), \
-             patch('bot.save_balance') as mock_save:
-            bot.update_balance(1.0, 'XXBTZUSD', 200.0, sold=False)
-        mock_save.assert_called_once()
-
-
-class TestSaveBalance(unittest.TestCase):
-    def test_writes_json_to_file(self):
-        data = {'ZUSD': '500.0'}
-        m = mock_open()
-        with patch('builtins.open', m):
-            bot.save_balance(data)
-        m.assert_called_once_with('balance.json', 'w')
-        handle = m()
-        written = ''.join(call.args[0] for call in handle.write.call_args_list)
-        self.assertIn('ZUSD', written)
+    def test_returns_empty_on_exception(self):
+        bot.k.query_private.side_effect = Exception('network error')
+        result = bot.get_balance()
+        self.assertEqual(result, {})
 
 
 class TestGetPurchasingPrice(unittest.TestCase):
@@ -121,20 +89,34 @@ class TestDeleteEntries(unittest.TestCase):
 
 
 class TestGetAvailableFunds(unittest.TestCase):
+    def _make_trades(self, held_pairs):
+        """Build a trades dict where held_pairs are currently bought (not sold)."""
+        trades = {p: [] for p in bot.get_pairs()}
+        for p in held_pairs:
+            trades[p] = [{'bought': True, 'sold': False, 'amount': 1.0,
+                          'price_usd': 100.0, 'time_stamp': '0'}]
+        return trades
+
     def test_divides_equally_when_no_cryptos_owned(self):
-        # balance has ZUSD + EUR.HOLD = 2 non-crypto entries, 0 cryptos owned
-        mock_balance = {'ZUSD': '600.0', 'EUR.HOLD': '0.0'}
-        with patch('bot.get_balance', return_value=mock_balance):
+        with patch('bot.get_balance', return_value={'ZUSD': '600.0'}), \
+             patch('bot.load_trades', return_value=self._make_trades([])):
             result = bot.get_available_funds()
-        # cryptos_not_owned = 6 - (2 - 2) = 6; 600 / 6 = 100
+        # 6 slots free → 600 / 6 = 100
         self.assertAlmostEqual(result, 100.0)
 
     def test_accounts_for_owned_cryptos(self):
-        mock_balance = {'ZUSD': '400.0', 'EUR.HOLD': '0.0', 'XETH': '1.0'}
-        with patch('bot.get_balance', return_value=mock_balance):
+        with patch('bot.get_balance', return_value={'ZUSD': '400.0'}), \
+             patch('bot.load_trades', return_value=self._make_trades(['XETHZUSD'])):
             result = bot.get_available_funds()
-        # cryptos_not_owned = 6 - (3 - 2) = 5; 400 / 5 = 80
+        # 1 held → 5 slots free → 400 / 5 = 80
         self.assertAlmostEqual(result, 80.0)
+
+    def test_returns_zero_when_all_slots_full(self):
+        all_pairs = list(bot.get_pairs())
+        with patch('bot.get_balance', return_value={'ZUSD': '0.0'}), \
+             patch('bot.load_trades', return_value=self._make_trades(all_pairs)):
+            result = bot.get_available_funds()
+        self.assertEqual(result, 0.0)
 
 
 class TestGetPairs(unittest.TestCase):
@@ -167,7 +149,7 @@ class TestMakeCryptoData(unittest.TestCase):
 
 class TestCheckOpportunity(unittest.TestCase):
     def _make_data(self, close_prices, current_price):
-        # Index [4] = close price (FIX 1: was [3] low price)
+        # Index [4] = close price
         prices = [[None, None, None, current_price * 0.99, current_price]] * 15
         return {'close': close_prices, 'prices': prices}
 
