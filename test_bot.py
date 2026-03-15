@@ -196,29 +196,30 @@ class TestCheckOpportunity(unittest.TestCase):
         result = bot.check_opportunity(data, 'XETHZUSD', sell=False, buy=True)
         self.assertFalse(result)
 
-    def test_sell_triggers_above_2_percent_profit(self):
-        data = self._make_data([100.0] * 15, 103.0)
+    def test_sell_triggers_above_3_percent_profit(self):
+        # take-profit at +3%
+        data = self._make_data([100.0] * 15, 104.0)
         with patch('bot.get_purchasing_price', return_value=100.0):
             result = bot.check_opportunity(data, 'XETHZUSD', sell=True, buy=False)
         self.assertTrue(result)
 
-    def test_sell_does_not_trigger_at_small_loss_within_buffer(self):
-        # FIX 2: loss of only 1% should NOT trigger stop-loss (buffer is 3%)
-        data = self._make_data([100.0] * 15, 99.0)
+    def test_sell_does_not_trigger_below_3_percent_profit(self):
+        # price only 2% above purchase — below the 3% take-profit threshold
+        data = self._make_data([100.0] * 15, 102.0)
         with patch('bot.get_purchasing_price', return_value=100.0):
             result = bot.check_opportunity(data, 'XETHZUSD', sell=True, buy=False)
         self.assertIsNone(result)
 
-    def test_sell_triggers_at_3_percent_loss(self):
-        # FIX 2: loss >= 3% triggers stop-loss
-        data = self._make_data([100.0] * 15, 96.0)
+    def test_sell_triggers_at_1_percent_loss(self):
+        # stop-loss at -1%
+        data = self._make_data([100.0] * 15, 98.5)
         with patch('bot.get_purchasing_price', return_value=100.0):
             result = bot.check_opportunity(data, 'XETHZUSD', sell=True, buy=False)
         self.assertTrue(result)
 
-    def test_sell_does_not_trigger_at_small_profit(self):
-        # price only 1% above purchase — below the 2% take-profit threshold
-        data = self._make_data([100.0] * 15, 101.0)
+    def test_sell_does_not_trigger_within_1_percent_loss(self):
+        # loss of only 0.5% — within the 1% stop-loss buffer
+        data = self._make_data([100.0] * 15, 99.6)
         with patch('bot.get_purchasing_price', return_value=100.0):
             result = bot.check_opportunity(data, 'XETHZUSD', sell=True, buy=False)
         self.assertIsNone(result)
