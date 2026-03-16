@@ -17,7 +17,7 @@ _TRAILING_STOP = 0.99   # trailing stop: -1% from peak MA
 _WINDOW_SECONDS = 43200  # 12-hour rolling window
 _MAX_MA_HISTORY = 200   # cap for MA lists
 
-_PAIRS = ('XETHZUSD', 'XXBTZUSD', 'MANAUSD', 'GRTUSD', 'LSKUSD', 'SCUSD')
+_PAIRS = ('XETHZEUR', 'XXBTZEUR', 'MANAEUR', 'GRTEUR', 'LSKEUR', 'SCEUR')
 
 
 def now():
@@ -157,7 +157,7 @@ def delete_entries(data, key):
 
 def get_available_funds():
     balance = get_balance()
-    money = float(balance.get('ZUSD', 0))
+    money = float(balance.get('ZEUR', 0))
     # Count how many of our pairs are currently held (have an open buy)
     trades = load_trades()
     pairs_held = sum(

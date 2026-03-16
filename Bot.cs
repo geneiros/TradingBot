@@ -19,7 +19,7 @@ static class Config
     public const int    MaxMaHistory   = 200;   // cap for MA lists
 
     public static readonly string[] Pairs =
-        ["XETHZUSD", "XXBTZUSD", "MANAUSD", "GRTUSD", "LSKUSD", "SCUSD"];
+        ["XETHZEUR", "XXBTZEUR", "MANAEUR", "GRTEUR", "LSKEUR", "SCEUR"];
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +202,7 @@ class Bot(KrakenClient kraken)
     public async Task<double> GetAvailableFundsAsync()
     {
         var balance = await GetBalanceAsync();
-        balance.TryGetValue("ZUSD", out var zusdStr);
+        balance.TryGetValue("ZEUR", out var zusdStr);
         double money = double.TryParse(zusdStr, out var m) ? m : 0.0;
 
         var trades    = LoadTrades();
