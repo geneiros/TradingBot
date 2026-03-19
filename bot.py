@@ -11,7 +11,7 @@ _OHLC_LOW = 3
 _OHLC_CLOSE = 4
 
 # Trading thresholds
-_PROFIT_TARGET = 1.05   # take profit at +5%
+_PROFIT_TARGET = 1.03   # take profit at +3%
 _STOP_LOSS = 0.99       # stop-loss at -1%
 _TRAILING_STOP = 0.99   # trailing stop: -1% from peak MA
 _WINDOW_SECONDS = 43200  # 12-hour rolling window
@@ -252,7 +252,7 @@ def check_opportunity(data, name, sell, buy):
         purchase_price = float(get_purchasing_price(name))
         peak_ma = max(data['close']) if data['close'] else purchase_price
         if price >= purchase_price * _PROFIT_TARGET:
-            print(f'Taking profit (+{int((_PROFIT_TARGET - 1) * 100)}%)')
+            print(f'Taking profit at +3% → SELL')
             return True
         if price < purchase_price * _STOP_LOSS:
             print('Stop-loss triggered (-1%)')
