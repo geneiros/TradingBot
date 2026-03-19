@@ -215,13 +215,13 @@ def check_data(name, crypto_data, should_buy, mva):
 
 
 def try_buy(data, name, crypto_data):
-    make_trade = check_opportunity(data, name, False, True)
+    make_trade = check_opportunity(data, name, crypto_data, False, True)
     if make_trade:
         print('Buy Crypto ' + name)
         buy_crypto(crypto_data, name)
 
 
-def check_opportunity(data, name, sell, buy):
+def check_opportunity(data, name, crypto_data, sell, buy):
     count = 0
     previous_value = 0
     trends = []
@@ -246,13 +246,13 @@ def check_opportunity(data, name, sell, buy):
             previous_value = mva
 
     areas = []
-    price = float(data['prices'][-1][_OHLC_CLOSE])
+    price = float(crypto_data[-1][_OHLC_CLOSE])  # always use live price
 
     if sell:
         purchase_price = float(get_purchasing_price(name))
         peak_ma = max(data['close']) if data['close'] else purchase_price
         if price >= purchase_price * _PROFIT_TARGET:
-            print(f'Taking profit (+{int((_PROFIT_TARGET - 1) * 100)}%)')
+            print(f'Taking profit at +3% → SELL')
             return True
         if price < purchase_price * _STOP_LOSS:
             print('Stop-loss triggered (-1%)')
@@ -275,7 +275,7 @@ def check_opportunity(data, name, sell, buy):
 
 
 def try_sell(data, name, crypto_data):
-    make_trade = check_opportunity(data, name, True, False)
+    make_trade = check_opportunity(data, name, crypto_data, True, False)
     if make_trade:
         print('Sell Crypto ' + name)
         sell_crypto(crypto_data, name)
