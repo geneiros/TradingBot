@@ -11,7 +11,7 @@ _OHLC_LOW = 3
 _OHLC_CLOSE = 4
 
 # Trading thresholds
-_PROFIT_TARGET = 1.05   # take profit at +5%
+_PROFIT_TARGET = 1.03   # take profit at +3%
 _STOP_LOSS = 0.99       # stop-loss at -1%
 _TRAILING_STOP = 0.99   # trailing stop: -1% from peak MA
 _WINDOW_SECONDS = 43200  # 12-hour rolling window
