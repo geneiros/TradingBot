@@ -176,6 +176,9 @@ def bot(k_api, pairs):
     mva = load_crypto_data_from_file()
     while True:
         since = str(int(time.time() - _WINDOW_SECONDS))
+        balance = get_balance()
+        eur = float(balance.get('ZEUR', 0))
+        print(f'[Cycle] Balance: {eur:.2f} EUR')
         trades = load_trades()  # load once per cycle, shared across all pairs
         for pair in pairs:
             try:
