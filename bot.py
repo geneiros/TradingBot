@@ -176,25 +176,16 @@ def bot(k_api, pairs):
     mva = load_crypto_data_from_file()
     while True:
         since = str(int(time.time() - _WINDOW_SECONDS))
-        balance = get_balance()
-        eur = float(balance.get('ZEUR', 0))
         trades = load_trades()  # load once per cycle, shared across all pairs
-        portfolio_eur = 0.0
         for pair in pairs:
             try:
                 crypto_data = get_crypto_data(pair, since)
                 last_trade = trades[pair][-1] if trades[pair] else None
                 should_buy = last_trade is None or last_trade['sold']
-                if not should_buy:
-                    price = float(crypto_data[-1][_OHLC_CLOSE])
-                    amount = float(last_trade['amount'])
-                    portfolio_eur += price * amount
                 check_data(pair, crypto_data, should_buy, mva)
                 mva = load_crypto_data_from_file()
             except Exception as e:
                 print(f'Error processing {pair}: {e}')
-        total = eur + portfolio_eur
-        print(f'[Cycle] Cash: {eur:.2f} EUR | Crypto: {portfolio_eur:.2f} EUR | Total: {total:.2f} EUR')
         time.sleep(20)
 
 
@@ -224,6 +215,8 @@ def check_data(name, crypto_data, should_buy, mva):
 
 
 def try_buy(data, name, crypto_data):
+    price = float(crypto_data[-1][_OHLC_CLOSE])
+    print(f'[{name}] BUY mode  | price={price:.2f}')
     make_trade = check_opportunity(data, name, crypto_data, False, True)
     if make_trade:
         print('Buy Crypto ' + name)
@@ -259,7 +252,9 @@ def check_opportunity(data, name, crypto_data, sell, buy):
 
     if sell:
         purchase_price = float(get_purchasing_price(name))
+        profit_pct = (price / purchase_price - 1) * 100
         peak_ma = max(data['close']) if data['close'] else purchase_price
+        print(f'[{name}] SELL mode | price={price:.2f} buy={purchase_price:.2f} profit={profit_pct:+.2f}% | peak_ma={peak_ma:.2f}')
         if price >= purchase_price * _PROFIT_TARGET:
             print(f'Taking profit at +3% → SELL')
             return True
