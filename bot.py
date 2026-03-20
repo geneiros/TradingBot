@@ -224,6 +224,8 @@ def check_data(name, crypto_data, should_buy, mva):
 
 
 def try_buy(data, name, crypto_data):
+    price = float(crypto_data[-1][_OHLC_CLOSE])
+    print(f'[{name}] BUY mode  | price={price:.2f}')
     make_trade = check_opportunity(data, name, crypto_data, False, True)
     if make_trade:
         print('Buy Crypto ' + name)
@@ -259,7 +261,9 @@ def check_opportunity(data, name, crypto_data, sell, buy):
 
     if sell:
         purchase_price = float(get_purchasing_price(name))
+        profit_pct = (price / purchase_price - 1) * 100
         peak_ma = max(data['close']) if data['close'] else purchase_price
+        print(f'[{name}] SELL mode | price={price:.2f} buy={purchase_price:.2f} profit={profit_pct:+.2f}% | peak_ma={peak_ma:.2f}')
         if price >= purchase_price * _PROFIT_TARGET:
             print(f'Taking profit at +3% → SELL')
             return True
