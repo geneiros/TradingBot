@@ -1,322 +1,361 @@
-#!/usr/bin/env python3
 """
-Monte Carlo simulation of TradingBot — 1000 independent runs.
-Each run uses a different random seed, trend mix, volatility and starting prices.
+Monte Carlo comparison: 3 trailing-stop strategies × 3 drift scenarios.
+
+Strategies tested:
+  1. Current    : TRAILING_STOP=0.99, activates as soon as peak > buy
+  2. Solution 1 : TRAILING_STOP=0.98, wider (-2% from peak), same activation
+  3. Solution 2 : TRAILING_STOP=0.99, activates only when peak > buy * 1.015
+
+Method (2-phase):
+  Phase 1 – For each (strategy, scenario): run 1,000,000 independent
+            single-trade GBM simulations and record the P&L %.
+  Phase 2 – Bootstrap 50-trade sequences (trades are i.i.d. within a
+            scenario) to compound a starting balance of 1,000 EUR and
+            study the resulting balance distribution.
+
+Price model: Geometric Brownian Motion on 1-minute candles.
+  σ = 4% daily vol / sqrt(1440)  ≈ 0.001054 per candle.
 """
 
-import sys, json, time, random, os, tempfile, statistics
-from unittest.mock import MagicMock
-from collections import defaultdict
+import time
+import numpy as np
 
-sys.modules['krakenex'] = MagicMock()
-import bot
-from unittest.mock import patch as _patch
-import io as _io
+# ── GBM parameters ────────────────────────────────────────────────────────────
+DAILY_VOL  = 0.04
+SIGMA      = DAILY_VOL / np.sqrt(1440)   # per 1-min candle ≈ 0.001054
+MAX_STEPS  = 3_000                        # cap per trade (~50 h)
+N_SIMS     = 1_000_000
+N_TRADES   = 50                           # trades per balance simulation
+INITIAL    = 1_000.0                      # starting balance in EUR
+SEED       = 42
 
-# Suppress internal bot prints (TRADE: logs, buy/sell confirmations)
-_devnull = open(os.devnull, 'w')
+# ── Common stop constants ──────────────────────────────────────────────────────
+PROFIT_TARGET = 1.03
+STOP_LOSS     = 0.99
 
-def _silent_save_trade(close, name, bought, sold, amount):
-    """save_trade without print output."""
-    trade = {
-        'time_stamp': str(int(time.time())),
-        'price_usd':  close,
-        'bought':     bought,
-        'sold':       sold,
-        'amount':     amount,
-    }
-    trades = bot.load_trades()
-    trades[name].append(trade)
-    with open('trades.json', 'w') as f:
-        json.dump(trades, f, indent=4)
+# ── Strategy definitions ───────────────────────────────────────────────────────
+STRATEGIES = [
+    dict(name="Current    (trail=0.99, peak>buy)",
+         trail_threshold=0.99, trail_activation=1.000),
+    dict(name="Solution 1 (trail=0.98, wider)",
+         trail_threshold=0.98, trail_activation=1.000),
+    dict(name="Solution 2 (trail=0.99, peak>buy*1.015)",
+         trail_threshold=0.99, trail_activation=1.015),
+]
 
-def _silent_buy(crypto_data, name):
-    bot.clear_crypto_data(name)
-    price   = float(crypto_data[-1][4])
-    funds   = bot.get_available_funds()
-    amount  = funds * (1 / price)
-    bot.update_balance(amount, name, price, False)
-    _silent_save_trade(price, name, True, False, amount)
+# ── Market scenarios ───────────────────────────────────────────────────────────
+SCENARIOS = [
+    dict(label="Bear   (μ=-0.0002/candle)", mu=-0.0002),
+    dict(label="Neutral (μ=0)",              mu=0.0000),
+    dict(label="Bull   (μ=+0.0002/candle)", mu=+0.0002),
+]
 
-def _silent_sell(crypto_data, name):
-    balance = bot.get_balance()
-    bot.clear_crypto_data(name)
-    price   = float(crypto_data[-1][4])
-    amount  = float(balance[name[:-4]])
-    bot.update_balance(amount, name, price, True)
-    _silent_save_trade(price, name, False, True, amount)
 
-bot.save_trade  = _silent_save_trade
-bot.buy_crypto  = _silent_buy
-bot.sell_crypto = _silent_sell
+# ─────────────────────────────────────────────────────────────────────────────
+def simulate_single_trades(strategy: dict, mu: float,
+                            rng: np.random.Generator) -> np.ndarray:
+    """
+    Vectorised single-trade simulation for N_SIMS paths.
+    Returns array of P&L % (float32).
+    """
+    trail_thr = strategy['trail_threshold']
+    trail_act = strategy['trail_activation']
+    drift     = mu - 0.5 * SIGMA ** 2
 
-# ── Config ───────────────────────────────────────────────────────────────────
-NUM_SIMULATIONS = 1000
-NUM_CYCLES      = 20
-INITIAL_USD     = 10_000.0
-PAIRS           = bot.get_pairs()
+    prices      = np.ones(N_SIMS, dtype=np.float64)
+    peaks       = np.ones(N_SIMS, dtype=np.float64)
+    active      = np.ones(N_SIMS, dtype=bool)
+    exit_price  = np.ones(N_SIMS, dtype=np.float64)
+    exit_reason = np.full(N_SIMS, 3, dtype=np.int8)   # 3 = timeout
 
-BASE_PRICES = {
-    'XETHZUSD': 2000.0,
-    'XXBTZUSD': 40000.0,
-    'MANAUSD':  0.50,
-    'GRTUSD':   0.15,
-    'LSKUSD':   1.50,
-    'SCUSD':    0.003,
-}
+    for step in range(MAX_STEPS):
+        if not active.any():
+            break
+        z          = rng.standard_normal(N_SIMS)
+        new_prices = np.where(active, prices * np.exp(drift + SIGMA * z), prices)
+        new_peaks  = np.where(active, np.maximum(peaks, new_prices), peaks)
 
-# ── Setup temp dir ────────────────────────────────────────────────────────────
-tmpdir = tempfile.mkdtemp(prefix='tradingbot_mc_')
-os.chdir(tmpdir)
+        profit_hit = active & (new_prices >= PROFIT_TARGET)
+        stop_hit   = active & (new_prices <  STOP_LOSS)
+        trail_hit  = (active
+                      & (new_peaks > trail_act)          # activation guard
+                      & (new_prices < new_peaks * trail_thr))
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def generate_ohlc(base_price, n=200, trend='up', vol=0.004):
-    candles, price = [], base_price
-    t = int(time.time()) - n * 60
-    drift = {'up': (0.0003, 0.0015), 'down': (-0.0015, -0.0003), 'flat': (-0.0005, 0.0005)}
-    lo, hi = drift[trend]
-    for i in range(n):
-        price *= 1 + random.uniform(lo, hi) + random.uniform(-vol, vol)
-        price  = max(price, 1e-6)
-        high   = price * (1 + abs(random.uniform(0, vol)))
-        low    = price * (1 - abs(random.uniform(0, vol)))
-        close  = price * (1 + random.uniform(-vol / 2, vol / 2))
-        candles.append([
-            t + i * 60,
-            f"{price:.8f}", f"{high:.8f}", f"{low:.8f}", f"{close:.8f}",
-            f"{(high+low+close)/3:.8f}", f"{random.uniform(10,500):.2f}",
-            random.randint(50, 500)
-        ])
-    return candles
+        fired = profit_hit | stop_hit | trail_hit
+        exit_reason[profit_hit]                              = 0
+        exit_reason[stop_hit   & ~profit_hit]               = 1
+        exit_reason[trail_hit  & ~profit_hit & ~stop_hit]   = 2
+        exit_price[fired] = new_prices[fired]
+        active[fired]     = False
+        prices = new_prices
+        peaks  = new_peaks
 
-def reset_state():
-    with open('balance.json', 'w') as f:
-        json.dump({'ZUSD': str(INITIAL_USD), 'EUR.HOLD': '0.0'}, f)
-    with open('trades.json', 'w') as f:
-        json.dump({p: [] for p in PAIRS}, f)
-    bot.mva = bot.make_crypto_data({})
-    with open('data.json', 'w') as f:
-        json.dump(bot.mva, f)
+    exit_price[active] = prices[active]   # timeout exits
+    return ((exit_price - 1.0) * 100.0).astype(np.float32), exit_reason
 
-def holdings_value(balance, history):
-    """Estimate total value of held crypto at last known price."""
-    val = 0.0
-    for pair in PAIRS:
-        sym = pair[:-4]          # e.g. 'XETHZUSD' → 'XETH', 'LSKUSD' → 'LS'
-        qty = float(balance.get(sym, 0))
-        if qty > 0:
-            val += qty * float(history[pair][-1][4])
-    return val
 
-def run_one(seed):
-    random.seed(seed)
-    reset_state()
+# ─────────────────────────────────────────────────────────────────────────────
+def bootstrap_balance(pnl_pct: np.ndarray,
+                       rng: np.random.Generator) -> np.ndarray:
+    """
+    Sample N_SIMS sequences of N_TRADES trades (with replacement) and
+    compound a 1,000 EUR balance. Returns final balances (float32).
+    """
+    factors  = (1.0 + pnl_pct / 100.0).astype(np.float32)
+    # shape: (N_SIMS, N_TRADES)
+    sampled  = rng.choice(factors, size=(N_SIMS, N_TRADES), replace=True)
+    balances = INITIAL * sampled.prod(axis=1)
+    return balances.astype(np.float32)
 
-    # Random market scenario
-    vol    = random.uniform(0.002, 0.010)
-    trends = {p: random.choice(['up', 'down', 'flat']) for p in PAIRS}
-    prices = {p: BASE_PRICES[p] * random.uniform(0.80, 1.20) for p in PAIRS}
-    hist   = {p: generate_ohlc(prices[p], n=200, trend=trends[p], vol=vol) for p in PAIRS}
 
-    for cycle in range(NUM_CYCLES):
-        for pair in PAIRS:
-            trades     = bot.load_trades()
-            end        = min(100 + cycle, len(hist[pair]))
-            cdata      = hist[pair][end - 100: end]
-            last_trade = trades[pair][-1] if trades[pair] else None
-            should_buy = (last_trade is None) or last_trade['sold']
-            bot.check_data(pair, cdata, should_buy)
-            bot.mva = bot.load_crypto_data_from_file()
+# ─────────────────────────────────────────────────────────────────────────────
+def print_separator(char="─", width=66):
+    print(char * width)
 
-    bal          = bot.get_balance()
-    usd          = float(bal.get('ZUSD', 0))
-    crypto_val   = holdings_value(bal, hist)
-    total        = usd + crypto_val
-    all_trades   = bot.load_trades()
-    n_trades     = sum(len(v) for v in all_trades.values())
 
-    # Count profitable sells
-    n_profit = n_loss = 0
-    for tlist in all_trades.values():
-        for i, t in enumerate(tlist):
-            if t['sold']:
-                buy_price  = next((b['price_usd'] for b in reversed(tlist[:i]) if b['bought']), None)
-                if buy_price is not None:
-                    if t['price_usd'] >= buy_price * 1.02:
-                        n_profit += 1
-                    elif t['price_usd'] < buy_price * 0.97:
-                        n_loss += 1
+def print_header(text, char="═", width=66):
+    print(char * width)
+    print(f"  {text}")
+    print(char * width)
 
-    return {
-        'seed':        seed,
-        'trends':      trends,
-        'vol':         vol,
-        'final_usd':   usd,
-        'crypto_val':  crypto_val,
-        'total':       total,
-        'pnl':         total - INITIAL_USD,
-        'pnl_pct':     (total - INITIAL_USD) / INITIAL_USD * 100,
-        'n_trades':    n_trades,
-        'n_profit':    n_profit,
-        'n_loss':      n_loss,
-    }
 
-# ── Run ───────────────────────────────────────────────────────────────────────
-print(f"\n{'═'*64}")
-print(f"  MONTE CARLO — {NUM_SIMULATIONS} simulations × {NUM_CYCLES} cycles × {len(PAIRS)} pairs")
-print(f"  Initial capital : ${INITIAL_USD:,.0f}")
-print(f"  Market scenarios: random trends (up/flat/down) + random vol")
-print(f"{'═'*64}\n")
+def analyse_single_trade(pnl: np.ndarray, exit_reason: np.ndarray,
+                          strategy_name: str, scenario_label: str) -> dict:
+    EXIT_LABELS = {0: 'profit_target', 1: 'stop_loss',
+                   2: 'trailing_stop',  3: 'timeout'}
 
-import contextlib
+    n      = len(pnl)
+    counts = {k: int((exit_reason == k).sum()) for k in range(4)}
+    wins   = pnl[pnl > 0]
+    losses = pnl[pnl <= 0]
+    win_rate = len(wins) / n
 
-start_t = time.time()
-results = []
-for i in range(NUM_SIMULATIONS):
-    with contextlib.redirect_stdout(open(os.devnull, 'w')):
-        results.append(run_one(i))
-    if (i + 1) % 100 == 0:
-        elapsed = time.time() - start_t
-        eta     = elapsed / (i + 1) * (NUM_SIMULATIONS - i - 1)
-        sys.stdout.write(f"  [{i+1:5d}/{NUM_SIMULATIONS}]  elapsed {elapsed:5.1f}s  ETA {eta:5.1f}s\n")
-        sys.stdout.flush()
+    avg_win  = float(wins.mean())   if len(wins)   > 0 else 0.0
+    avg_loss = float(losses.mean()) if len(losses) > 0 else 0.0
+    rr       = abs(avg_win / avg_loss) if avg_loss != 0 else float('inf')
+    ev       = float(pnl.mean())
+    kelly    = (win_rate - (1 - win_rate) / rr) if rr != float('inf') else win_rate
 
-elapsed_total = time.time() - start_t
-print(f"\n  Completed in {elapsed_total:.1f}s\n")
+    # trailing-stop sub-stats
+    ts = exit_reason == 2
+    ts_avg = float(pnl[ts].mean()) if ts.sum() > 0 else 0.0
+    ts_pos_pct = float((pnl[ts] > 0).mean() * 100) if ts.sum() > 0 else 0.0
 
-# ── Statistics ────────────────────────────────────────────────────────────────
-pnl_pcts   = [r['pnl_pct']  for r in results]
-totals     = [r['total']    for r in results]
-n_trades_l = [r['n_trades'] for r in results]
+    return dict(
+        ev=ev, win_rate=win_rate*100, kelly=kelly*100,
+        avg_win=avg_win, avg_loss=avg_loss, rr=rr,
+        counts=counts, n=n,
+        ts_n=int(ts.sum()), ts_avg=ts_avg, ts_pos_pct=ts_pos_pct,
+        sl_n=counts[1], sl_avg=avg_loss if counts[1] > 0 else 0.0,
+        pnl=pnl,
+    )
 
-profitable  = sum(1 for p in pnl_pcts if p > 0)
-at_loss     = sum(1 for p in pnl_pcts if p < 0)
-unchanged   = sum(1 for p in pnl_pcts if p == 0)
 
-mean_pnl    = statistics.mean(pnl_pcts)
-median_pnl  = statistics.median(pnl_pcts)
-stdev_pnl   = statistics.stdev(pnl_pcts)
-min_pnl     = min(pnl_pcts)
-max_pnl     = max(pnl_pcts)
+def analyse_balance(balances: np.ndarray) -> dict:
+    final = balances
+    return dict(
+        mean   = float(final.mean()),
+        median = float(np.median(final)),
+        std    = float(final.std()),
+        p5     = float(np.percentile(final, 5)),
+        p10    = float(np.percentile(final, 10)),
+        p25    = float(np.percentile(final, 25)),
+        p75    = float(np.percentile(final, 75)),
+        p90    = float(np.percentile(final, 90)),
+        p95    = float(np.percentile(final, 95)),
+        p99    = float(np.percentile(final, 99)),
+        pct_profit = float((final > INITIAL).mean() * 100),
+        pct_loss50 = float((final < INITIAL * 0.5).mean() * 100),
+    )
 
-sorted_pnl  = sorted(pnl_pcts)
-p5          = sorted_pnl[int(0.05  * NUM_SIMULATIONS)]
-p25         = sorted_pnl[int(0.25  * NUM_SIMULATIONS)]
-p75         = sorted_pnl[int(0.75  * NUM_SIMULATIONS)]
-p95         = sorted_pnl[int(0.95  * NUM_SIMULATIONS)]
 
-print(f"{'═'*64}")
-print(f"  RESULTS — P&L % distribution")
-print(f"{'═'*64}")
-print(f"  Profitable simulations : {profitable:5d} / {NUM_SIMULATIONS}  ({profitable/NUM_SIMULATIONS*100:.1f}%)")
-print(f"  At a loss              : {at_loss:5d} / {NUM_SIMULATIONS}  ({at_loss/NUM_SIMULATIONS*100:.1f}%)")
-print(f"  Unchanged (no trades)  : {unchanged:5d} / {NUM_SIMULATIONS}  ({unchanged/NUM_SIMULATIONS*100:.1f}%)")
-print()
-print(f"  Mean P&L    : {mean_pnl:+.2f}%   (${statistics.mean(totals)-INITIAL_USD:+,.0f})")
-print(f"  Median P&L  : {median_pnl:+.2f}%   (${statistics.median(totals)-INITIAL_USD:+,.0f})")
-print(f"  Std Dev     : {stdev_pnl:.2f}%")
-print()
-print(f"  Percentiles:")
-print(f"    P5  (worst  5%) : {p5:+.2f}%   (${sorted_pnl[int(0.05*NUM_SIMULATIONS)]/100*INITIAL_USD+INITIAL_USD-INITIAL_USD:+,.0f})")
-print(f"    P25             : {p25:+.2f}%   (${sorted_pnl[int(0.25*NUM_SIMULATIONS)]/100*INITIAL_USD+INITIAL_USD-INITIAL_USD:+,.0f})")
-print(f"    P75             : {p75:+.2f}%   (${sorted_pnl[int(0.75*NUM_SIMULATIONS)]/100*INITIAL_USD+INITIAL_USD-INITIAL_USD:+,.0f})")
-print(f"    P95 (best   5%) : {p95:+.2f}%   (${sorted_pnl[int(0.95*NUM_SIMULATIONS)]/100*INITIAL_USD+INITIAL_USD-INITIAL_USD:+,.0f})")
-print(f"    Min (worst)     : {min_pnl:+.2f}%")
-print(f"    Max (best)      : {max_pnl:+.2f}%")
-print()
-print(f"  Avg trades per simulation : {statistics.mean(n_trades_l):.1f}")
-print(f"  Max trades in one sim     : {max(n_trades_l)}")
+# ─────────────────────────────────────────────────────────────────────────────
+def main():
+    rng = np.random.default_rng(SEED)
 
-# ── ASCII histogram ───────────────────────────────────────────────────────────
-print(f"\n{'═'*64}")
-print(f"  P&L DISTRIBUTION (histogram, {NUM_SIMULATIONS} runs)")
-print(f"{'═'*64}")
+    print_header(f"TradingBot Monte Carlo — {N_SIMS:,} simulations")
+    print(f"  Strategies : {len(STRATEGIES)}")
+    print(f"  Scenarios  : {len(SCENARIOS)}")
+    print(f"  σ/candle   = {SIGMA:.6f}  (daily vol = {DAILY_VOL*100:.1f}%)")
+    print(f"  Start bal  = {INITIAL:,.0f} EUR   over {N_TRADES} trades")
+    print()
 
-BUCKETS   = 20
-bmin, bmax = min(pnl_pcts) - 0.01, max(pnl_pcts) + 0.01
-bsize     = (bmax - bmin) / BUCKETS
-counts    = [0] * BUCKETS
-for p in pnl_pcts:
-    idx = min(int((p - bmin) / bsize), BUCKETS - 1)
-    counts[idx] += 1
+    # Store all results: results[scenario][strategy]
+    all_single = {}   # single-trade stats
+    all_balance = {}  # balance stats
 
-max_count = max(counts)
-bar_width = 40
+    for sc in SCENARIOS:
+        sc_label = sc['label']
+        all_single[sc_label]  = {}
+        all_balance[sc_label] = {}
+        print(f">> Scenario: {sc_label}")
+        for st in STRATEGIES:
+            t0 = time.perf_counter()
+            print(f"   Running '{st['name']}' ...", end=' ', flush=True)
 
-for i, c in enumerate(counts):
-    lo  = bmin + i * bsize
-    hi  = lo + bsize
-    bar = '█' * int(c / max_count * bar_width)
-    mid = (lo + hi) / 2
-    marker = ' ← 0%' if lo <= 0 <= hi else ''
-    print(f"  {mid:+7.2f}% |{bar:<{bar_width}}| {c:4d}{marker}")
+            # Phase 1: single-trade simulation
+            pnl, exit_r = simulate_single_trades(st, sc['mu'], rng)
+            t1 = time.perf_counter()
 
-# ── Per-pair analysis ─────────────────────────────────────────────────────────
-print(f"\n{'═'*64}")
-print(f"  PER-PAIR TRADE ANALYSIS")
-print(f"{'═'*64}")
+            # Phase 2: bootstrap balance
+            bals = bootstrap_balance(pnl, rng)
+            t2 = time.perf_counter()
 
-pair_trades   = defaultdict(int)
-pair_profits  = defaultdict(int)
-pair_losses   = defaultdict(int)
-trend_wins    = defaultdict(lambda: defaultdict(int))
-trend_total   = defaultdict(lambda: defaultdict(int))
+            single_stats  = analyse_single_trade(pnl, exit_r, st['name'], sc_label)
+            balance_stats = analyse_balance(bals)
 
-for r in results:
-    reset_state()  # just to avoid stale reads — we re-read from last sim
-    # we track via result metadata only
-    for pair in PAIRS:
-        t = r['trends'][pair]
-        trend_total[pair][t] += 1
+            all_single[sc_label][st['name']]  = single_stats
+            all_balance[sc_label][st['name']] = balance_stats
 
-# Recount trades by pair across all simulations (re-run light analysis)
-# We'll aggregate from the trade files — actually we don't have per-sim files saved.
-# Instead use the per-result 'n_trades' as proxy and mark by trend.
-print(f"  {'Pair':<14} {'Up wins':>8} {'Down wins':>10} {'Flat wins':>10}")
-print(f"  {'-'*14} {'-'*8} {'-'*10} {'-'*10}")
+            print(f"done  ({t2-t0:.1f}s)")
 
-def trend_outcome_rate(pair, trend):
-    wins = sum(1 for r in results
-               if r['trends'][pair] == trend and r['pnl_pct'] > 0)
-    total = sum(1 for r in results if r['trends'][pair] == trend)
-    return f"{wins}/{total} ({wins/total*100:.0f}%)" if total else "n/a"
+        print()
 
-for pair in PAIRS:
-    up   = trend_outcome_rate(pair, 'up')
-    down = trend_outcome_rate(pair, 'down')
-    flat = trend_outcome_rate(pair, 'flat')
-    print(f"  {pair:<14} {up:>14} {down:>14} {flat:>14}")
+    # ── DETAILED REPORT ────────────────────────────────────────────────────
+    EXIT_LABELS = {0: 'profit_target', 1: 'stop_loss',
+                   2: 'trailing_stop',  3: 'timeout'}
 
-# ── Top 3 best / worst ────────────────────────────────────────────────────────
-print(f"\n{'═'*64}")
-print(f"  TOP 3 BEST SCENARIOS")
-print(f"{'═'*64}")
-for r in sorted(results, key=lambda x: x['pnl_pct'], reverse=True)[:3]:
-    trends_str = '  '.join(f"{p.replace('ZUSD','').replace('USD','')[:4]}:{r['trends'][p][0].upper()}"
-                            for p in PAIRS)
-    print(f"  Seed {r['seed']:4d}  P&L={r['pnl_pct']:+.2f}%  trades={r['n_trades']:3d}  vol={r['vol']:.3f}  [{trends_str}]")
+    for sc in SCENARIOS:
+        sc_label = sc['label']
+        print()
+        print_header(f"SCENARIO: {sc_label}")
 
-print(f"\n{'═'*64}")
-print(f"  TOP 3 WORST SCENARIOS")
-print(f"{'═'*64}")
-for r in sorted(results, key=lambda x: x['pnl_pct'])[:3]:
-    trends_str = '  '.join(f"{p.replace('ZUSD','').replace('USD','')[:4]}:{r['trends'][p][0].upper()}"
-                            for p in PAIRS)
-    print(f"  Seed {r['seed']:4d}  P&L={r['pnl_pct']:+.2f}%  trades={r['n_trades']:3d}  vol={r['vol']:.3f}  [{trends_str}]")
+        # Per-strategy detail
+        for st in STRATEGIES:
+            sn = st['name']
+            s  = all_single[sc_label][sn]
+            b  = all_balance[sc_label][sn]
 
-# ── Risk metrics ──────────────────────────────────────────────────────────────
-sharpe  = mean_pnl / stdev_pnl if stdev_pnl else 0
-win_rate = profitable / NUM_SIMULATIONS
-avg_win  = statistics.mean(p for p in pnl_pcts if p > 0) if profitable else 0
-avg_loss = statistics.mean(p for p in pnl_pcts if p < 0) if at_loss else 0
-rr_ratio = abs(avg_win / avg_loss) if avg_loss else float('inf')
+            print()
+            print(f"  ── Strategy: {sn}")
+            print(f"     Exit distribution (single trade):")
+            for k, lbl in EXIT_LABELS.items():
+                pct = s['counts'][k] / N_SIMS * 100
+                bar = '█' * int(pct / 2)
+                print(f"       {lbl:<16} {s['counts'][k]:>8,}  ({pct:>6.2f}%)  {bar}")
 
-print(f"\n{'═'*64}")
-print(f"  RISK METRICS")
-print(f"{'═'*64}")
-print(f"  Win rate          : {win_rate*100:.1f}%")
-print(f"  Avg gain (wins)   : {avg_win:+.2f}%")
-print(f"  Avg loss (losses) : {avg_loss:+.2f}%")
-print(f"  Reward/Risk ratio : {rr_ratio:.2f}x")
-print(f"  Sharpe (approx.)  : {sharpe:.3f}")
-print(f"{'═'*64}\n")
+            print(f"     P&L per trade:")
+            print(f"       EV            : {s['ev']:>+9.4f}%")
+            print(f"       Win rate      : {s['win_rate']:>9.2f}%")
+            print(f"       Avg win       : {s['avg_win']:>+9.4f}%")
+            print(f"       Avg loss      : {s['avg_loss']:>+9.4f}%")
+            print(f"       R/R ratio     : {s['rr']:>9.4f}")
+            print(f"       Kelly         : {s['kelly']:>+9.2f}%")
+            print(f"     Trailing stop   : {s['ts_n']:>7,} fires  avg={s['ts_avg']:>+.4f}%  "
+                  f"profitable: {s['ts_pos_pct']:.1f}%")
+            print(f"     Balance after {N_TRADES} trades (start={INITIAL:,.0f} EUR):")
+            print(f"       Mean          : {b['mean']:>10,.2f} EUR")
+            print(f"       Median        : {b['median']:>10,.2f} EUR")
+            print(f"       p5 / p95      : {b['p5']:>10,.2f} / {b['p95']:>10,.2f} EUR")
+            print(f"       p10 / p90     : {b['p10']:>10,.2f} / {b['p90']:>10,.2f} EUR")
+            print(f"       % above start : {b['pct_profit']:>9.2f}%")
+            print(f"       % below 50%   : {b['pct_loss50']:>9.2f}%  (ruin risk)")
+
+    # ── COMPARISON TABLES ──────────────────────────────────────────────────
+    print()
+    print_header("COMPARISON TABLE — Per-trade Expected Value", "═")
+    hdr = f"  {'Strategy':<42}"
+    for sc in SCENARIOS:
+        hdr += f"  {'EV%':>7}"
+    print(hdr)
+    print_separator()
+    for st in STRATEGIES:
+        sn  = st['name']
+        row = f"  {sn:<42}"
+        for sc in SCENARIOS:
+            ev = all_single[sc['label']][sn]['ev']
+            row += f"  {ev:>+7.4f}"
+        print(row)
+
+    print()
+    print_header("COMPARISON TABLE — Mean Final Balance (EUR, 50 trades)", "═")
+    hdr = f"  {'Strategy':<42}"
+    for sc in SCENARIOS:
+        hdr += f"  {'Mean€':>9}"
+    print(hdr)
+    print_separator()
+    for st in STRATEGIES:
+        sn  = st['name']
+        row = f"  {sn:<42}"
+        for sc in SCENARIOS:
+            m = all_balance[sc['label']][sn]['mean']
+            row += f"  {m:>9,.1f}"
+        print(row)
+
+    print()
+    print_header("COMPARISON TABLE — Median Final Balance (EUR, 50 trades)", "═")
+    hdr = f"  {'Strategy':<42}"
+    for sc in SCENARIOS:
+        hdr += f"  {'Median€':>9}"
+    print(hdr)
+    print_separator()
+    for st in STRATEGIES:
+        sn  = st['name']
+        row = f"  {sn:<42}"
+        for sc in SCENARIOS:
+            m = all_balance[sc['label']][sn]['median']
+            row += f"  {m:>9,.1f}"
+        print(row)
+
+    print()
+    print_header("COMPARISON TABLE — p5 Worst-Case Balance (EUR, 50 trades)", "═")
+    hdr = f"  {'Strategy':<42}"
+    for sc in SCENARIOS:
+        hdr += f"  {'p5 EUR':>9}"
+    print(hdr)
+    print_separator()
+    for st in STRATEGIES:
+        sn  = st['name']
+        row = f"  {sn:<42}"
+        for sc in SCENARIOS:
+            m = all_balance[sc['label']][sn]['p5']
+            row += f"  {m:>9,.1f}"
+        print(row)
+
+    print()
+    print_header("COMPARISON TABLE — % Simulations ending above 1,000 EUR", "═")
+    hdr = f"  {'Strategy':<42}"
+    for sc in SCENARIOS:
+        hdr += f"  {'%>1000':>7}"
+    print(hdr)
+    print_separator()
+    for st in STRATEGIES:
+        sn  = st['name']
+        row = f"  {sn:<42}"
+        for sc in SCENARIOS:
+            p = all_balance[sc['label']][sn]['pct_profit']
+            row += f"  {p:>7.2f}"
+        print(row)
+
+    print()
+    print_header("COMPARISON TABLE — Trailing Stop: % of exits that were profitable", "═")
+    hdr = f"  {'Strategy':<42}"
+    for sc in SCENARIOS:
+        hdr += f"  {'TS+%':>7}"
+    print(hdr)
+    print_separator()
+    for st in STRATEGIES:
+        sn  = st['name']
+        row = f"  {sn:<42}"
+        for sc in SCENARIOS:
+            p = all_single[sc['label']][sn]['ts_pos_pct']
+            row += f"  {p:>7.1f}"
+        print(row)
+
+    print()
+    print_header("SUMMARY & RECOMMENDATION", "═")
+    print("""
+  The tables above compare the three strategies across bear / neutral / bull
+  markets on both per-trade profitability and compounded 50-trade performance.
+
+  Key metrics to judge:
+    EV%     – expected return per trade (higher is better)
+    Median  – most likely balance after 50 trades
+    p5      – worst-case balance (5th percentile); captures downside risk
+    %>1000  – probability of being in profit after 50 trades
+    TS+%    – % of trailing-stop exits that were profitable (quality of exits)
+""")
+
+
+if __name__ == '__main__':
+    main()

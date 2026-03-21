@@ -269,7 +269,7 @@ def check_opportunity(data, name, crypto_data, sell, buy):
         if price < purchase_price * _STOP_LOSS:
             print('Stop-loss triggered (-1%)')
             return True
-        if peak_price > purchase_price and price < peak_price * _TRAILING_STOP:
+        if peak_price > purchase_price * 1.015 and price < peak_price * _TRAILING_STOP:
             print(f'Trailing stop triggered (-1% from peak {peak_price:.8f})')
             return True
 
