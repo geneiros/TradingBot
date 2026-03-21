@@ -81,7 +81,8 @@ def make_crypto_data(data):
             'high': [],
             'low': [],
             'close': [],
-            'prices': []
+            'prices': [],
+            'peak_price': 0.0
         }
     return data
 
@@ -145,8 +146,9 @@ def sell_crypto(crypto_data, name):
 
 def clear_crypto_data(name):
     data = load_crypto_data_from_file()
-    for key in data[name]:
+    for key in ('high', 'low', 'close', 'prices'):
         data[name][key] = data[name][key][-10:]
+    data[name]['peak_price'] = 0.0  # reset on buy
     save_crypto_data(data)
     return data
 
@@ -207,6 +209,11 @@ def check_data(name, crypto_data, should_buy, mva):
     for key in ('high', 'low', 'close'):
         if len(mva[name][key]) > _MAX_MA_HISTORY:
             mva[name][key] = mva[name][key][-_MAX_MA_HISTORY:]
+    # Track real peak price while holding a position
+    if not should_buy:
+        current_price = float(crypto_data[-1][_OHLC_CLOSE])
+        if current_price > mva[name].get('peak_price', 0.0):
+            mva[name]['peak_price'] = current_price
     save_crypto_data(mva)
 
     if should_buy:
@@ -254,12 +261,16 @@ def check_opportunity(data, name, crypto_data, sell, buy):
     if sell:
         purchase_price = float(get_purchasing_price(name))
         profit_pct = (price / purchase_price - 1) * 100
-        print(f'[{name}] SELL mode | price={price:.8f} buy={purchase_price:.8f} profit={profit_pct:+.4f}%')
+        peak_price = data.get('peak_price', 0.0)
+        print(f'[{name}] SELL mode | price={price:.8f} buy={purchase_price:.8f} profit={profit_pct:+.4f}% | peak={peak_price:.8f}')
         if price >= purchase_price * _PROFIT_TARGET:
             print(f'Taking profit at +3% → SELL')
             return True
         if price < purchase_price * _STOP_LOSS:
             print('Stop-loss triggered (-1%)')
+            return True
+        if peak_price > purchase_price and price < peak_price * _TRAILING_STOP:
+            print(f'Trailing stop triggered (-1% from peak {peak_price:.8f})')
             return True
 
     for mva in reversed(data['close'][-5:]):
