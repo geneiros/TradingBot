@@ -254,16 +254,12 @@ def check_opportunity(data, name, crypto_data, sell, buy):
     if sell:
         purchase_price = float(get_purchasing_price(name))
         profit_pct = (price / purchase_price - 1) * 100
-        peak_ma = max(data['close']) if data['close'] else purchase_price
-        print(f'[{name}] SELL mode | price={price:.8f} buy={purchase_price:.8f} profit={profit_pct:+.4f}% | peak_ma={peak_ma:.8f}')
+        print(f'[{name}] SELL mode | price={price:.8f} buy={purchase_price:.8f} profit={profit_pct:+.4f}%')
         if price >= purchase_price * _PROFIT_TARGET:
             print(f'Taking profit at +3% → SELL')
             return True
         if price < purchase_price * _STOP_LOSS:
             print('Stop-loss triggered (-1%)')
-            return True
-        if price < peak_ma * _TRAILING_STOP:
-            print('Trailing stop triggered (-1% from peak MA)')
             return True
 
     for mva in reversed(data['close'][-5:]):
