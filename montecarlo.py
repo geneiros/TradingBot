@@ -1,225 +1,360 @@
 """
-Monte Carlo simulation for TradingBot sell-exit logic.
+Monte Carlo comparison: 3 trailing-stop strategies × 3 drift scenarios.
 
-Mirrors the exact constants and conditions from bot.py:
-  - Take profit  : price >= buy * 1.03
-  - Stop-loss    : price < buy * 0.99
-  - Trailing stop: peak > buy AND price < peak * 0.99
+Strategies tested:
+  1. Current    : TRAILING_STOP=0.99, activates as soon as peak > buy
+  2. Solution 1 : TRAILING_STOP=0.98, wider (-2% from peak), same activation
+  3. Solution 2 : TRAILING_STOP=0.99, activates only when peak > buy * 1.015
 
-Each simulation starts at entry (price = 1.0) and runs until one of the
-three conditions fires or the step limit is reached (timeout).
+Method (2-phase):
+  Phase 1 – For each (strategy, scenario): run 1,000,000 independent
+            single-trade GBM simulations and record the P&L %.
+  Phase 2 – Bootstrap 50-trade sequences (trades are i.i.d. within a
+            scenario) to compound a starting balance of 1,000 EUR and
+            study the resulting balance distribution.
 
-Price model: Geometric Brownian Motion (GBM) on 1-minute candles.
-  σ_candle derived from daily volatility assumption.
-  Three drift scenarios: bear, neutral, bull.
+Price model: Geometric Brownian Motion on 1-minute candles.
+  σ = 4% daily vol / sqrt(1440)  ≈ 0.001054 per candle.
 """
 
 import time
 import numpy as np
 
-# ── Bot constants (must mirror bot.py) ────────────────────────────────────────
-PROFIT_TARGET  = 1.03
-STOP_LOSS      = 0.99
-TRAILING_STOP  = 0.99
+# ── GBM parameters ────────────────────────────────────────────────────────────
+DAILY_VOL  = 0.04
+SIGMA      = DAILY_VOL / np.sqrt(1440)   # per 1-min candle ≈ 0.001054
+MAX_STEPS  = 3_000                        # cap per trade (~50 h)
+N_SIMS     = 1_000_000
+N_TRADES   = 50                           # trades per balance simulation
+INITIAL    = 1_000.0                      # starting balance in EUR
+SEED       = 42
 
-# ── Simulation parameters ──────────────────────────────────────────────────────
-N_SIMS      = 1_000_000
-MAX_STEPS   = 3_000        # ~50 h of 1-min candles; plenty to exit
-SEED        = 42
+# ── Common stop constants ──────────────────────────────────────────────────────
+PROFIT_TARGET = 1.03
+STOP_LOSS     = 0.99
 
-# GBM: σ per 1-min candle derived from daily vol (√1440 minutes/day)
-DAILY_VOL   = 0.04         # 4 % daily σ (conservative crypto estimate)
-SIGMA       = DAILY_VOL / np.sqrt(1440)   # ≈ 0.001054 per minute
+# ── Strategy definitions ───────────────────────────────────────────────────────
+STRATEGIES = [
+    dict(name="Current    (trail=0.99, peak>buy)",
+         trail_threshold=0.99, trail_activation=1.000),
+    dict(name="Solution 1 (trail=0.98, wider)",
+         trail_threshold=0.98, trail_activation=1.000),
+    dict(name="Solution 2 (trail=0.99, peak>buy*1.015)",
+         trail_threshold=0.99, trail_activation=1.015),
+]
 
-EXIT_LABELS = {0: 'profit_target', 1: 'stop_loss', 2: 'trailing_stop', 3: 'timeout'}
-EXIT_COLORS = {0: '✅', 1: '🔴', 2: '🟡', 3: '⏱️ '}
+# ── Market scenarios ───────────────────────────────────────────────────────────
+SCENARIOS = [
+    dict(label="Bear   (μ=-0.0002/candle)", mu=-0.0002),
+    dict(label="Neutral (μ=0)",              mu=0.0000),
+    dict(label="Bull   (μ=+0.0002/candle)", mu=+0.0002),
+]
 
 
-def run_scenario(mu: float, label: str, rng: np.random.Generator) -> dict:
-    """Vectorised simulation for one drift scenario."""
-    print(f"  Running '{label}' (mu={mu:+.6f}/candle) ...", flush=True)
-    t0 = time.perf_counter()
+# ─────────────────────────────────────────────────────────────────────────────
+def simulate_single_trades(strategy: dict, mu: float,
+                            rng: np.random.Generator) -> np.ndarray:
+    """
+    Vectorised single-trade simulation for N_SIMS paths.
+    Returns array of P&L % (float32).
+    """
+    trail_thr = strategy['trail_threshold']
+    trail_act = strategy['trail_activation']
+    drift     = mu - 0.5 * SIGMA ** 2
 
-    prices      = np.ones(N_SIMS)
-    peaks       = np.ones(N_SIMS)
+    prices      = np.ones(N_SIMS, dtype=np.float64)
+    peaks       = np.ones(N_SIMS, dtype=np.float64)
     active      = np.ones(N_SIMS, dtype=bool)
-    exit_price  = np.ones(N_SIMS)
-    exit_reason = np.full(N_SIMS, 3, dtype=np.int8)  # default = timeout
-    exit_step   = np.full(N_SIMS, MAX_STEPS, dtype=np.int32)
-
-    drift = mu - 0.5 * SIGMA ** 2          # log-space drift correction
+    exit_price  = np.ones(N_SIMS, dtype=np.float64)
+    exit_reason = np.full(N_SIMS, 3, dtype=np.int8)   # 3 = timeout
 
     for step in range(MAX_STEPS):
         if not active.any():
             break
-
-        # ── Price move (all sims, masked by active) ──────────────────────
-        z = rng.standard_normal(N_SIMS)
+        z          = rng.standard_normal(N_SIMS)
         new_prices = np.where(active, prices * np.exp(drift + SIGMA * z), prices)
         new_peaks  = np.where(active, np.maximum(peaks, new_prices), peaks)
 
-        # ── Exit conditions ────────────────────────────────────────────────
         profit_hit = active & (new_prices >= PROFIT_TARGET)
         stop_hit   = active & (new_prices <  STOP_LOSS)
-        trail_hit  = active & (new_peaks > 1.0) & (new_prices < new_peaks * TRAILING_STOP)
+        trail_hit  = (active
+                      & (new_peaks > trail_act)          # activation guard
+                      & (new_prices < new_peaks * trail_thr))
 
         fired = profit_hit | stop_hit | trail_hit
-
-        exit_reason[profit_hit]                          = 0
-        exit_reason[stop_hit & ~profit_hit]              = 1
-        exit_reason[trail_hit & ~profit_hit & ~stop_hit] = 2
-
+        exit_reason[profit_hit]                              = 0
+        exit_reason[stop_hit   & ~profit_hit]               = 1
+        exit_reason[trail_hit  & ~profit_hit & ~stop_hit]   = 2
         exit_price[fired] = new_prices[fired]
-        exit_step[fired]  = step + 1
         active[fired]     = False
-
         prices = new_prices
         peaks  = new_peaks
 
-    # Timeout: record last price
-    exit_price[active] = prices[active]
-    exit_step[active]  = MAX_STEPS
-
-    elapsed = time.perf_counter() - t0
-
-    return {
-        'label':       label,
-        'mu':          mu,
-        'profits_pct': (exit_price - 1.0) * 100.0,
-        'exit_reason': exit_reason,
-        'exit_step':   exit_step,
-        'elapsed':     elapsed,
-    }
+    exit_price[active] = prices[active]   # timeout exits
+    return ((exit_price - 1.0) * 100.0).astype(np.float32), exit_reason
 
 
-def analyse(result: dict) -> None:
-    label       = result['label']
-    profits     = result['profits_pct']
-    exit_reason = result['exit_reason']
-    exit_step   = result['exit_step']
-    elapsed     = result['elapsed']
+# ─────────────────────────────────────────────────────────────────────────────
+def bootstrap_balance(pnl_pct: np.ndarray,
+                       rng: np.random.Generator) -> np.ndarray:
+    """
+    Sample N_SIMS sequences of N_TRADES trades (with replacement) and
+    compound a 1,000 EUR balance. Returns final balances (float32).
+    """
+    factors  = (1.0 + pnl_pct / 100.0).astype(np.float32)
+    # shape: (N_SIMS, N_TRADES)
+    sampled  = rng.choice(factors, size=(N_SIMS, N_TRADES), replace=True)
+    balances = INITIAL * sampled.prod(axis=1)
+    return balances.astype(np.float32)
 
-    n      = len(profits)
+
+# ─────────────────────────────────────────────────────────────────────────────
+def print_separator(char="─", width=66):
+    print(char * width)
+
+
+def print_header(text, char="═", width=66):
+    print(char * width)
+    print(f"  {text}")
+    print(char * width)
+
+
+def analyse_single_trade(pnl: np.ndarray, exit_reason: np.ndarray,
+                          strategy_name: str, scenario_label: str) -> dict:
+    EXIT_LABELS = {0: 'profit_target', 1: 'stop_loss',
+                   2: 'trailing_stop',  3: 'timeout'}
+
+    n      = len(pnl)
     counts = {k: int((exit_reason == k).sum()) for k in range(4)}
-    wins   = profits[profits > 0]
-    losses = profits[profits <= 0]
-
-    print()
-    print("=" * 62)
-    print(f"  SCENARIO: {label}")
-    print("=" * 62)
-    print(f"  Simulations   : {n:>12,}")
-    print(f"  Steps cap     : {MAX_STEPS:>12,}  (~{MAX_STEPS/1440:.1f} trading days)")
-    print(f"  Compute time  : {elapsed:>11.2f} s")
-    print()
-
-    print("-- Exit distribution ------------------------------------------")
-    for k, lbl in EXIT_LABELS.items():
-        pct = counts[k] / n * 100
-        bar = '#' * int(pct / 2)
-        print(f"  {EXIT_COLORS[k]} {lbl:<16} {counts[k]:>8,}  ({pct:>6.2f}%)  {bar}")
-    print()
-
-    print("-- P&L statistics (% per trade) --------------------------------")
-    print(f"  Mean return        : {profits.mean():>+9.4f}%")
-    print(f"  Median return      : {np.median(profits):>+9.4f}%")
-    print(f"  Std dev            : {profits.std():>9.4f}%")
-    print(f"  Win rate (P&L > 0) : {len(wins)/n*100:>9.2f}%")
-    print(f"  Profit-target hits : {counts[0]/n*100:>9.2f}%")
-    print()
-
-    print("-- Percentile table --------------------------------------------")
-    for p in [1, 5, 10, 25, 50, 75, 90, 95, 99]:
-        v = np.percentile(profits, p)
-        print(f"  p{p:<3}  {v:>+9.4f}%")
-    print()
-
-    print("-- Risk / reward -----------------------------------------------")
-    avg_win  = wins.mean()   if len(wins)   > 0 else 0.0
-    avg_loss = losses.mean() if len(losses) > 0 else 0.0
-    rr_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else float('inf')
-    ev       = profits.mean()
+    wins   = pnl[pnl > 0]
+    losses = pnl[pnl <= 0]
     win_rate = len(wins) / n
-    kelly    = (win_rate - (1 - win_rate) / rr_ratio) if rr_ratio != float('inf') else win_rate
-    print(f"  Avg win            : {avg_win:>+9.4f}%")
-    print(f"  Avg loss           : {avg_loss:>+9.4f}%")
-    print(f"  Risk/reward ratio  : {rr_ratio:>9.4f}")
-    print(f"  Expected value     : {ev:>+9.4f}%  per trade")
-    print(f"  Kelly fraction     : {kelly*100:>+9.2f}%  of capital")
-    print()
 
-    print("-- Holding time (candles = 1-min bars) -------------------------")
-    print(f"  Mean               : {exit_step.mean():>9.1f}")
-    print(f"  Median             : {np.median(exit_step):>9.0f}")
-    print(f"  p10                : {np.percentile(exit_step, 10):>9.0f}")
-    print(f"  p90                : {np.percentile(exit_step, 90):>9.0f}")
-    print()
+    avg_win  = float(wins.mean())   if len(wins)   > 0 else 0.0
+    avg_loss = float(losses.mean()) if len(losses) > 0 else 0.0
+    rr       = abs(avg_win / avg_loss) if avg_loss != 0 else float('inf')
+    ev       = float(pnl.mean())
+    kelly    = (win_rate - (1 - win_rate) / rr) if rr != float('inf') else win_rate
 
-    print("-- Tail risk ---------------------------------------------------")
-    var99  = np.percentile(profits, 1)
-    cvar99 = profits[profits <= var99].mean()
-    print(f"  5th pct outcome    : {np.percentile(profits, 5):>+9.4f}%")
-    print(f"  VaR  1%            : {var99:>+9.4f}%")
-    print(f"  CVaR 1%            : {cvar99:>+9.4f}%  (avg beyond VaR)")
-    print()
+    # trailing-stop sub-stats
+    ts = exit_reason == 2
+    ts_avg = float(pnl[ts].mean()) if ts.sum() > 0 else 0.0
+    ts_pos_pct = float((pnl[ts] > 0).mean() * 100) if ts.sum() > 0 else 0.0
 
-    print("-- Trailing stop effectiveness ---------------------------------")
-    ts_mask = exit_reason == 2
-    sl_mask = exit_reason == 1
-    ts_n    = ts_mask.sum()
-    sl_n    = sl_mask.sum()
-    if ts_n > 0:
-        ts_pos = (profits[ts_mask] > 0).sum()
-        ts_avg = profits[ts_mask].mean()
-        print(f"  Trailing stop fires : {ts_n:>7,}  avg={ts_avg:>+.4f}%  profitable: {ts_pos/ts_n*100:.1f}%")
-    else:
-        print(f"  Trailing stop fires :       0")
-    if sl_n > 0:
-        print(f"  Stop-loss fires     : {sl_n:>7,}  avg={profits[sl_mask].mean():>+.4f}%")
-    else:
-        print(f"  Stop-loss fires     :       0")
-    print()
+    return dict(
+        ev=ev, win_rate=win_rate*100, kelly=kelly*100,
+        avg_win=avg_win, avg_loss=avg_loss, rr=rr,
+        counts=counts, n=n,
+        ts_n=int(ts.sum()), ts_avg=ts_avg, ts_pos_pct=ts_pos_pct,
+        sl_n=counts[1], sl_avg=avg_loss if counts[1] > 0 else 0.0,
+        pnl=pnl,
+    )
 
 
+def analyse_balance(balances: np.ndarray) -> dict:
+    final = balances
+    return dict(
+        mean   = float(final.mean()),
+        median = float(np.median(final)),
+        std    = float(final.std()),
+        p5     = float(np.percentile(final, 5)),
+        p10    = float(np.percentile(final, 10)),
+        p25    = float(np.percentile(final, 25)),
+        p75    = float(np.percentile(final, 75)),
+        p90    = float(np.percentile(final, 90)),
+        p95    = float(np.percentile(final, 95)),
+        p99    = float(np.percentile(final, 99)),
+        pct_profit = float((final > INITIAL).mean() * 100),
+        pct_loss50 = float((final < INITIAL * 0.5).mean() * 100),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 def main():
-    print(f"TradingBot Monte Carlo  --  {N_SIMS:,} simulations per scenario")
-    print(f"  PROFIT_TARGET={PROFIT_TARGET}  STOP_LOSS={STOP_LOSS}  TRAILING_STOP={TRAILING_STOP}")
-    print(f"  sigma/candle={SIGMA:.6f}  (daily vol = {DAILY_VOL*100:.1f}%,  1-min candles)")
-    print()
-
     rng = np.random.default_rng(SEED)
 
-    scenarios = [
-        (-0.0002, "Bear   (-0.02%/candle drift)"),
-        ( 0.0000, "Neutral (no drift)"),
-        ( 0.0002, "Bull   (+0.02%/candle drift)"),
-    ]
-
-    results = []
-    for mu, label in scenarios:
-        results.append(run_scenario(mu, label, rng))
-
-    for r in results:
-        analyse(r)
-
-    # Cross-scenario summary
-    print("=" * 62)
-    print("  CROSS-SCENARIO SUMMARY")
-    print("=" * 62)
-    print(f"  {'Scenario':<35} {'EV %':>8}  {'Win%':>6}  {'Kelly%':>7}")
-    print(f"  {'-'*35} {'-'*8}  {'-'*6}  {'-'*7}")
-    for r in results:
-        p        = r['profits_pct']
-        wins     = p[p > 0]
-        losses   = p[p <= 0]
-        win_rate = len(wins) / len(p)
-        avg_win  = wins.mean()   if len(wins)   > 0 else 0
-        avg_loss = losses.mean() if len(losses) > 0 else 0
-        rr       = abs(avg_win / avg_loss) if avg_loss != 0 else 1
-        kelly    = win_rate - (1 - win_rate) / rr
-        ev       = p.mean()
-        print(f"  {r['label']:<35} {ev:>+8.4f}  {win_rate*100:>6.2f}  {kelly*100:>+7.2f}")
+    print_header(f"TradingBot Monte Carlo — {N_SIMS:,} simulations")
+    print(f"  Strategies : {len(STRATEGIES)}")
+    print(f"  Scenarios  : {len(SCENARIOS)}")
+    print(f"  σ/candle   = {SIGMA:.6f}  (daily vol = {DAILY_VOL*100:.1f}%)")
+    print(f"  Start bal  = {INITIAL:,.0f} EUR   over {N_TRADES} trades")
     print()
+
+    # Store all results: results[scenario][strategy]
+    all_single = {}   # single-trade stats
+    all_balance = {}  # balance stats
+
+    for sc in SCENARIOS:
+        sc_label = sc['label']
+        all_single[sc_label]  = {}
+        all_balance[sc_label] = {}
+        print(f">> Scenario: {sc_label}")
+        for st in STRATEGIES:
+            t0 = time.perf_counter()
+            print(f"   Running '{st['name']}' ...", end=' ', flush=True)
+
+            # Phase 1: single-trade simulation
+            pnl, exit_r = simulate_single_trades(st, sc['mu'], rng)
+            t1 = time.perf_counter()
+
+            # Phase 2: bootstrap balance
+            bals = bootstrap_balance(pnl, rng)
+            t2 = time.perf_counter()
+
+            single_stats  = analyse_single_trade(pnl, exit_r, st['name'], sc_label)
+            balance_stats = analyse_balance(bals)
+
+            all_single[sc_label][st['name']]  = single_stats
+            all_balance[sc_label][st['name']] = balance_stats
+
+            print(f"done  ({t2-t0:.1f}s)")
+
+        print()
+
+    # ── DETAILED REPORT ────────────────────────────────────────────────────
+    EXIT_LABELS = {0: 'profit_target', 1: 'stop_loss',
+                   2: 'trailing_stop',  3: 'timeout'}
+
+    for sc in SCENARIOS:
+        sc_label = sc['label']
+        print()
+        print_header(f"SCENARIO: {sc_label}")
+
+        # Per-strategy detail
+        for st in STRATEGIES:
+            sn = st['name']
+            s  = all_single[sc_label][sn]
+            b  = all_balance[sc_label][sn]
+
+            print()
+            print(f"  ── Strategy: {sn}")
+            print(f"     Exit distribution (single trade):")
+            for k, lbl in EXIT_LABELS.items():
+                pct = s['counts'][k] / N_SIMS * 100
+                bar = '█' * int(pct / 2)
+                print(f"       {lbl:<16} {s['counts'][k]:>8,}  ({pct:>6.2f}%)  {bar}")
+
+            print(f"     P&L per trade:")
+            print(f"       EV            : {s['ev']:>+9.4f}%")
+            print(f"       Win rate      : {s['win_rate']:>9.2f}%")
+            print(f"       Avg win       : {s['avg_win']:>+9.4f}%")
+            print(f"       Avg loss      : {s['avg_loss']:>+9.4f}%")
+            print(f"       R/R ratio     : {s['rr']:>9.4f}")
+            print(f"       Kelly         : {s['kelly']:>+9.2f}%")
+            print(f"     Trailing stop   : {s['ts_n']:>7,} fires  avg={s['ts_avg']:>+.4f}%  "
+                  f"profitable: {s['ts_pos_pct']:.1f}%")
+            print(f"     Balance after {N_TRADES} trades (start={INITIAL:,.0f} EUR):")
+            print(f"       Mean          : {b['mean']:>10,.2f} EUR")
+            print(f"       Median        : {b['median']:>10,.2f} EUR")
+            print(f"       p5 / p95      : {b['p5']:>10,.2f} / {b['p95']:>10,.2f} EUR")
+            print(f"       p10 / p90     : {b['p10']:>10,.2f} / {b['p90']:>10,.2f} EUR")
+            print(f"       % above start : {b['pct_profit']:>9.2f}%")
+            print(f"       % below 50%   : {b['pct_loss50']:>9.2f}%  (ruin risk)")
+
+    # ── COMPARISON TABLES ──────────────────────────────────────────────────
+    print()
+    print_header("COMPARISON TABLE — Per-trade Expected Value", "═")
+    hdr = f"  {'Strategy':<42}"
+    for sc in SCENARIOS:
+        hdr += f"  {'EV%':>7}"
+    print(hdr)
+    print_separator()
+    for st in STRATEGIES:
+        sn  = st['name']
+        row = f"  {sn:<42}"
+        for sc in SCENARIOS:
+            ev = all_single[sc['label']][sn]['ev']
+            row += f"  {ev:>+7.4f}"
+        print(row)
+
+    print()
+    print_header("COMPARISON TABLE — Mean Final Balance (EUR, 50 trades)", "═")
+    hdr = f"  {'Strategy':<42}"
+    for sc in SCENARIOS:
+        hdr += f"  {'Mean€':>9}"
+    print(hdr)
+    print_separator()
+    for st in STRATEGIES:
+        sn  = st['name']
+        row = f"  {sn:<42}"
+        for sc in SCENARIOS:
+            m = all_balance[sc['label']][sn]['mean']
+            row += f"  {m:>9,.1f}"
+        print(row)
+
+    print()
+    print_header("COMPARISON TABLE — Median Final Balance (EUR, 50 trades)", "═")
+    hdr = f"  {'Strategy':<42}"
+    for sc in SCENARIOS:
+        hdr += f"  {'Median€':>9}"
+    print(hdr)
+    print_separator()
+    for st in STRATEGIES:
+        sn  = st['name']
+        row = f"  {sn:<42}"
+        for sc in SCENARIOS:
+            m = all_balance[sc['label']][sn]['median']
+            row += f"  {m:>9,.1f}"
+        print(row)
+
+    print()
+    print_header("COMPARISON TABLE — p5 Worst-Case Balance (EUR, 50 trades)", "═")
+    hdr = f"  {'Strategy':<42}"
+    for sc in SCENARIOS:
+        hdr += f"  {'p5 EUR':>9}"
+    print(hdr)
+    print_separator()
+    for st in STRATEGIES:
+        sn  = st['name']
+        row = f"  {sn:<42}"
+        for sc in SCENARIOS:
+            m = all_balance[sc['label']][sn]['p5']
+            row += f"  {m:>9,.1f}"
+        print(row)
+
+    print()
+    print_header("COMPARISON TABLE — % Simulations ending above 1,000 EUR", "═")
+    hdr = f"  {'Strategy':<42}"
+    for sc in SCENARIOS:
+        hdr += f"  {'%>1000':>7}"
+    print(hdr)
+    print_separator()
+    for st in STRATEGIES:
+        sn  = st['name']
+        row = f"  {sn:<42}"
+        for sc in SCENARIOS:
+            p = all_balance[sc['label']][sn]['pct_profit']
+            row += f"  {p:>7.2f}"
+        print(row)
+
+    print()
+    print_header("COMPARISON TABLE — Trailing Stop: % of exits that were profitable", "═")
+    hdr = f"  {'Strategy':<42}"
+    for sc in SCENARIOS:
+        hdr += f"  {'TS+%':>7}"
+    print(hdr)
+    print_separator()
+    for st in STRATEGIES:
+        sn  = st['name']
+        row = f"  {sn:<42}"
+        for sc in SCENARIOS:
+            p = all_single[sc['label']][sn]['ts_pos_pct']
+            row += f"  {p:>7.1f}"
+        print(row)
+
+    print()
+    print_header("SUMMARY & RECOMMENDATION", "═")
+    print("""
+  The tables above compare the three strategies across bear / neutral / bull
+  markets on both per-trade profitability and compounded 50-trade performance.
+
+  Key metrics to judge:
+    EV%     – expected return per trade (higher is better)
+    Median  – most likely balance after 50 trades
+    p5      – worst-case balance (5th percentile); captures downside risk
+    %>1000  – probability of being in profit after 50 trades
+    TS+%    – % of trailing-stop exits that were profitable (quality of exits)
+""")
 
 
 if __name__ == '__main__':
