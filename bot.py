@@ -15,6 +15,7 @@ _PROFIT_TARGET = 1.03        # take profit at +3%
 _STOP_LOSS = 0.99            # initial stop-loss at -1%
 _BREAK_EVEN_TRIGGER = 1.01   # once peak >= +1%, stop rises to break-even (0%)
 _TRAILING_STOP = 0.99        # trailing stop: -1% from peak
+_PROXIMITY_MIN = 0.97        # price must be within ~3% above recent MA (pullback entry)
 _WINDOW_SECONDS = 43200  # 12-hour rolling window
 _MAX_MA_HISTORY = 200   # cap for MA lists
 
@@ -288,8 +289,12 @@ def check_opportunity(data, name, crypto_data, sell, buy):
         if count >= 5:
             for area in areas:
                 counter += area
-            if len(areas) > 0 and counter / len(areas) >= 0.93:
-                return True
+            if len(areas) > 0 and counter / len(areas) >= _PROXIMITY_MIN:
+                # Only enter if the current candle is bullish (close >= open):
+                # price is bouncing off the MA, not still falling into it
+                candle_open = float(crypto_data[-1][1])
+                if price >= candle_open:
+                    return True
         return False
 
 
