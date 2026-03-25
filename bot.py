@@ -11,9 +11,10 @@ _OHLC_LOW = 3
 _OHLC_CLOSE = 4
 
 # Trading thresholds
-_PROFIT_TARGET = 1.03   # take profit at +3%
-_STOP_LOSS = 0.99       # stop-loss at -1%
-_TRAILING_STOP = 0.99   # trailing stop: -1% from peak MA
+_PROFIT_TARGET = 1.03        # take profit at +3%
+_STOP_LOSS = 0.99            # initial stop-loss at -1%
+_BREAK_EVEN_TRIGGER = 1.01   # once peak >= +1%, stop rises to break-even (0%)
+_TRAILING_STOP = 0.99        # trailing stop: -1% from peak
 _WINDOW_SECONDS = 43200  # 12-hour rolling window
 _MAX_MA_HISTORY = 200   # cap for MA lists
 
@@ -266,7 +267,13 @@ def check_opportunity(data, name, crypto_data, sell, buy):
         if price >= purchase_price * _PROFIT_TARGET:
             print(f'Taking profit at +3% → SELL')
             return True
-        if price < purchase_price * _STOP_LOSS:
+        # Break-even stop: once peak hit +1%, floor the stop at entry price
+        if peak_price >= purchase_price * _BREAK_EVEN_TRIGGER:
+            effective_stop = purchase_price
+            if price < effective_stop:
+                print(f'Break-even stop triggered (peak reached +1%) → SELL')
+                return True
+        elif price < purchase_price * _STOP_LOSS:
             print('Stop-loss triggered (-1%)')
             return True
         if peak_price > purchase_price * 1.015 and price < peak_price * _TRAILING_STOP:
