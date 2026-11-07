@@ -1,5 +1,7 @@
 # TradingBot
 
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/geneiros)
+
 Bot de trading automático de criptomoedas para a exchange **Kraken**. O bot
 monitoriza continuamente vários pares cotados em EUR, decide quando comprar
 e vender com base em médias móveis e regras de gestão de risco, e envia
@@ -21,7 +23,8 @@ ordens de mercado através da API da Kraken.
 6. [Ficheiros de estado](#ficheiros-de-estado)
 7. [Simulação, otimização e testes](#simulação-otimização-e-testes)
 8. [Versão C# (`Bot.cs`)](#versão-c-botcs)
-9. [Licença](#licença)
+9. [Apoiar o projeto](#apoiar-o-projeto)
+10. [Licença](#licença)
 
 ---
 
@@ -275,6 +278,16 @@ com break-even a +1%, trailing stop, proximidade 0.97 e vela de confirmação).
 ```bash
 dotnet run
 ```
+
+---
+
+## Apoiar o projeto
+
+Se este projeto lhe for útil, pode apoiar o desenvolvimento com um café ☕:
+
+<a href="https://buymeacoffee.com/geneiros"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black" alt="Buy Me a Coffee"></a>
+
+👉 [buymeacoffee.com/geneiros](https://buymeacoffee.com/geneiros)
 
 ---
 
