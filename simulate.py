@@ -1,168 +1,104 @@
 #!/usr/bin/env python3
 """
-Simulation of TradingBot with synthetic market data.
-Runs without real Kraken API keys using generated OHLC candles.
+Simulation of TradingBot (bot.py) with synthetic market data.
+
+Runs the real bot.py decision code (check_data → try_buy / try_sell →
+_place_order) against an in-memory fake Kraken (sim_kraken.FakeKraken),
+so no API keys or network access are needed and no real orders are sent.
+All JSON state files are written to a temporary directory.
+
+Usage:  python simulate.py [cycles] [seed]
 """
 
-import sys, json, time, random, os, tempfile
+import io
+import os
+import random
+import sys
+import tempfile
+import contextlib
 from unittest.mock import MagicMock
 
-# ── Mock krakenex before importing bot ───────────────────────────────────────
-sys.modules['krakenex'] = MagicMock()
-import bot
+# ── Mock krakenex before importing bot (not needed for the simulation) ───────
+sys.modules.setdefault('krakenex', MagicMock())
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bot                                   # noqa: E402
+from sim_kraken import FakeKraken, generate_ohlc, BASE_PRICES  # noqa: E402
 
-# ── Isolated temp directory for all JSON files ───────────────────────────────
-tmpdir = tempfile.mkdtemp(prefix='tradingbot_sim_')
-os.chdir(tmpdir)
+NUM_CYCLES = int(sys.argv[1]) if len(sys.argv) > 1 else 300
+SEED = int(sys.argv[2]) if len(sys.argv) > 2 else 7
+INITIAL_EUR = 1000.0
+WINDOW = 100                                 # candles returned per OHLC call
 
-PAIRS      = bot.get_pairs()
-NUM_CYCLES = 20
-random.seed(7)
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-def generate_ohlc(base_price, n=200, trend='up', vol=0.004):
-    """Return n OHLC candles as Kraken-style lists."""
-    candles, price = [], base_price
-    t = int(time.time()) - n * 60
-    drift_map = {'up': (0.0003, 0.0015), 'down': (-0.0015, -0.0003), 'flat': (-0.0005, 0.0005)}
-    lo, hi = drift_map[trend]
-    for i in range(n):
-        price *= 1 + random.uniform(lo, hi) + random.uniform(-vol, vol)
-        price  = max(price, 0.0001)
-        high   = price * (1 + abs(random.uniform(0, vol)))
-        low    = price * (1 - abs(random.uniform(0, vol)))
-        close  = price * (1 + random.uniform(-vol / 2, vol / 2))
-        vwap   = (high + low + close) / 3
-        candles.append([
-            t + i * 60,
-            f"{price:.6f}", f"{high:.6f}", f"{low:.6f}", f"{close:.6f}",
-            f"{vwap:.6f}", f"{random.uniform(10, 500):.2f}", random.randint(50, 500)
-        ])
-    return candles
-
-def section(title):
-    print(f"\n{'═'*62}")
-    print(f"  {title}")
-    print(f"{'═'*62}")
-
-def divider(title):
-    print(f"\n  ── {title} {'─'*(55 - len(title))}")
-
-def fmt_balance(bal):
-    usd  = float(bal.get('ZUSD', 0))
-    held = {k: float(v) for k, v in bal.items() if k not in ('ZUSD', 'EUR.HOLD')}
-    line = f"ZUSD=${usd:>12,.2f}"
-    for k, v in held.items():
-        line += f"  |  {k}={v:.6f}"
-    return line
-
-# ── Initial state ─────────────────────────────────────────────────────────────
-initial_balance = {'ZUSD': '10000.00', 'EUR.HOLD': '0.0'}
-with open('balance.json', 'w') as f:
-    json.dump(initial_balance, f)
-with open('trades.json', 'w') as f:
-    json.dump({p: [] for p in PAIRS}, f)
-
-bot.mva = bot.make_crypto_data({})
-with open('data.json', 'w') as f:
-    json.dump(bot.mva, f)
-
-# ── Synthetic market ──────────────────────────────────────────────────────────
-history = {
-    'XETHZUSD': generate_ohlc(2000.0,  trend='up'),
-    'XXBTZUSD': generate_ohlc(40000.0, trend='up'),
-    'MANAUSD':  generate_ohlc(0.50,    trend='flat'),
-    'GRTUSD':   generate_ohlc(0.15,    trend='down'),
-    'LSKUSD':   generate_ohlc(1.50,    trend='up'),
-    'SCUSD':    generate_ohlc(0.003,   trend='flat'),
+SCENARIOS = {
+    'XETHZEUR': 'up', 'XXBTZEUR': 'up', 'MANAEUR': 'flat',
+    'GRTEUR': 'down', 'LSKEUR': 'up', 'SCEUR': 'flat',
 }
 
-# ── Run simulation ────────────────────────────────────────────────────────────
-section("TRADINGBOT — SIMULATION")
-print(f"  Pairs      : {', '.join(PAIRS)}")
-print(f"  Cycles     : {NUM_CYCLES}  (each cycle ≈ 1 Kraken poll interval)")
-print(f"  Scenarios  : ETH/BTC uptrend | MANA/SC flat | GRT downtrend | LSK uptrend")
-print(f"  Start bal  : {fmt_balance(initial_balance)}")
 
-trade_log = []
+def main():
+    rng = random.Random(SEED)
+    os.chdir(tempfile.mkdtemp(prefix='tradingbot_sim_'))
+    bot._init_files()
 
-for cycle in range(1, NUM_CYCLES + 1):
-    divider(f"Cycle {cycle:02d}")
-    trades_before = sum(len(v) for v in bot.load_trades().values())
+    history = {p: generate_ohlc(BASE_PRICES[p], n=WINDOW + NUM_CYCLES,
+                                trend=SCENARIOS[p], rng=rng)
+               for p in bot.get_pairs()}
+    fake = FakeKraken(history, eur=INITIAL_EUR, window=WINDOW)
+    bot.k = fake
 
-    for pair in PAIRS:
-        trades     = bot.load_trades()
-        # sliding window: each cycle shifts 1 candle forward
-        window_end = min(100 + cycle, len(history[pair]))
-        crypto_data = history[pair][window_end - 100 : window_end]
-        cur_price   = float(crypto_data[-1][4])
+    print('═' * 62)
+    print('  TRADINGBOT — SIMULATION (bot.py on synthetic data)')
+    print('═' * 62)
+    print(f'  Cycles    : {NUM_CYCLES}  (1 cycle = 1 new 1-minute candle)')
+    print(f'  Scenarios : ' + ', '.join(f'{p}={t}' for p, t in SCENARIOS.items()))
+    print(f'  Start     : €{INITIAL_EUR:,.2f}')
+    print(f'  State dir : {os.getcwd()}')
 
-        if len(trades[pair]) > 0:
-            last = trades[pair][-1]
-            if last['sold']:
-                state      = "sold → BUY check"
-                should_buy = True
-            else:
-                state      = f"holding @ ${float(last['price_usd']):.4f} → SELL check"
-                should_buy = False
-        else:
-            state      = "no trades → BUY check"
-            should_buy = True
+    mva = bot.load_crypto_data_from_file()
+    for _ in range(NUM_CYCLES):
+        trades = bot.load_trades()
+        for pair in bot.get_pairs():
+            last = trades[pair][-1] if trades[pair] else None
+            should_buy = last is None or last['sold']
+            with contextlib.redirect_stdout(io.StringIO()):   # silence bot logs
+                bot.check_data(pair, fake.candles(pair), should_buy, mva)
+            mva = bot.load_crypto_data_from_file()
+        fake.advance()
+    fake.cursor -= 1  # last processed candle
 
-        print(f"    {pair:<14} ${cur_price:<12.4f}  {state}")
-        bot.check_data(pair, crypto_data, should_buy)
+    print('\n' + '─' * 62)
+    print('  ORDERS')
+    print('─' * 62)
+    if not fake.orders:
+        print('  (no orders placed)')
+    for cursor, pair, side, vol, price in fake.orders:
+        print(f'  t={cursor:>4}  {side.upper():<4} {pair:<9} qty={vol:<16.8f} @ €{price:,.6f}')
 
-        # Reload mva from file after potential buy/sell (syncs global with trimmed file)
-        bot.mva = bot.load_crypto_data_from_file()
+    trades = bot.load_trades()
+    wins = losses = 0
+    for pair, ts in trades.items():
+        buy = None
+        for t in ts:
+            if t['bought']:
+                buy = t
+            elif t['sold'] and buy:
+                if t['price_usd'] > buy['price_usd']:
+                    wins += 1
+                else:
+                    losses += 1
+                buy = None
 
-    trades_after = sum(len(v) for v in bot.load_trades().values())
-    new_trades   = trades_after - trades_before
-    bal          = bot.get_balance()
+    final = fake.total_value()
+    print('\n' + '─' * 62)
+    print('  SUMMARY')
+    print('─' * 62)
+    print(f'  Closed trades  : {wins + losses}  (wins={wins}, losses={losses})')
+    open_pos = [p for p, ts in trades.items() if ts and ts[-1]['bought']]
+    print(f'  Open positions : {", ".join(open_pos) or "none"}')
+    print(f'  Cash (EUR)     : €{fake.balance["ZEUR"]:,.2f}')
+    print(f'  Total value    : €{final:,.2f}  ({(final / INITIAL_EUR - 1) * 100:+.2f}%)')
+    print('═' * 62)
 
-    print(f"\n    Balance : {fmt_balance(bal)}")
-    if new_trades:
-        print(f"    *** {new_trades} trade(s) executed this cycle ***")
-        for pair in PAIRS:
-            ts = bot.load_trades()[pair]
-            if ts:
-                t = ts[-1]
-                if t['time_stamp'] == str(int(time.time())) or True:
-                    trade_log.append((cycle, pair, t))
 
-# ── Summary ───────────────────────────────────────────────────────────────────
-section("SIMULATION SUMMARY")
-final_bal = bot.get_balance()
-start_usd = float(initial_balance['ZUSD'])
-end_usd   = float(final_bal['ZUSD'])
-holdings  = {k: float(v) for k, v in final_bal.items() if k not in ('ZUSD', 'EUR.HOLD')}
-
-print(f"  Starting USD : ${start_usd:>12,.2f}")
-print(f"  Ending USD   : ${end_usd:>12,.2f}")
-print(f"  USD change   : ${end_usd - start_usd:>+12,.2f}")
-
-if holdings:
-    print(f"\n  Current holdings:")
-    for sym, qty in holdings.items():
-        pair  = sym + 'ZUSD'
-        price = float(history.get(pair, [[0]*5])[-1][4]) if pair in history else 0
-        val   = qty * price
-        print(f"    {sym:<10} qty={qty:.6f}  last_price=${price:.4f}  est_value=${val:.2f}")
-
-all_trades = bot.load_trades()
-total      = sum(len(v) for v in all_trades.values())
-print(f"\n  Total trades executed: {total}")
-
-if total:
-    print(f"\n  Trade history:")
-    for pair, ts in all_trades.items():
-        if ts:
-            for t in ts:
-                action = "BUY " if t['bought'] else "SELL"
-                print(f"    [{action}]  {pair:<14}  price=${float(t['price_usd']):<12.4f}  qty={float(t['amount']):.6f}")
-
-print(f"\n  MA entries built per pair:")
-for pair in PAIRS:
-    n = len(bot.mva.get(pair, {}).get('close', []))
-    print(f"    {pair:<14} {n} MA values")
-
-print(f"\n{'═'*62}\n")
+if __name__ == '__main__':
+    main()

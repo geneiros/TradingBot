@@ -10,10 +10,12 @@ import random, time, sys
 from multiprocessing import Pool, cpu_count
 
 # ── Strategy constants (mirror bot.py) ────────────────────────────────────────
-TAKE_PROFIT    = 1.05   # sell at +5%
-STOP_LOSS      = 0.99   # sell at -1%
-TRAILING_STOP  = 0.99   # sell if price < peak_MA * 0.99
-MA_THRESHOLD   = 0.93
+TAKE_PROFIT      = 1.03    # sell at +3%
+STOP_LOSS        = 0.99    # initial stop at -1%
+BREAK_EVEN       = 1.01    # once peak >= +1%, stop rises to entry (0%)
+TRAILING_STOP    = 0.99    # sell if price < peak * 0.99 ...
+TRAILING_TRIGGER = 1.015   # ... once peak > entry * 1.015
+MA_THRESHOLD     = 0.97    # avg(MA[-5:]) / price must be >= this
 MA_UPTREND_MIN = 5
 
 # ── Simulation config ──────────────────────────────────────────────────────────
@@ -60,7 +62,7 @@ def _simulate_one(seed):
         hist.append(closes)
 
     eur      = INITIAL_EUR
-    holdings = [None] * NUM_PAIRS   # None  or  (qty, buy_price)
+    holdings = [None] * NUM_PAIRS   # None  or  (qty, buy_price, peak_price)
     ma_hist  = [[]   for _ in range(NUM_PAIRS)]
 
     first_profit_cycle = -1
@@ -95,21 +97,30 @@ def _simulate_one(seed):
                 avg_ratio = sum(mv / cur for mv in last5) / 5
                 if avg_ratio < MA_THRESHOLD:
                     continue
+                # bullish candle confirmation (open ≈ previous close)
+                if cur < window[-2]:
+                    continue
                 n_free = NUM_PAIRS - sum(1 for h in holdings if h is not None)
                 if n_free > 0 and eur > 0.0:
                     funds        = eur / n_free
                     eur         -= funds
-                    holdings[i]  = (funds / cur, cur)
+                    holdings[i]  = (funds / cur, cur, cur)
                     ma_hist[i]   = mh[-10:]
             else:
                 # ── SELL check ───────────────────────────────────────────────
-                qty, buy_price = holdings[i]
+                qty, buy_price, peak = holdings[i]
                 mh   = ma_hist[i]
-                peak = max(mh) if mh else buy_price
-                if   cur >= buy_price * TAKE_PROFIT:   sell = True
-                elif cur <  buy_price * STOP_LOSS:     sell = True
-                elif cur <  peak      * TRAILING_STOP: sell = True
-                else:                                   sell = False
+                peak = max(peak, cur)
+                holdings[i] = (qty, buy_price, peak)
+                if cur >= buy_price * TAKE_PROFIT:
+                    sell = True
+                elif peak >= buy_price * BREAK_EVEN:
+                    sell = cur < buy_price          # break-even stop
+                else:
+                    sell = cur < buy_price * STOP_LOSS
+                if (not sell and peak > buy_price * TRAILING_TRIGGER
+                        and cur < peak * TRAILING_STOP):
+                    sell = True
                 if sell:
                     eur         += qty * cur
                     holdings[i]  = None
@@ -155,7 +166,7 @@ if __name__ == '__main__':
     print(f"  Initial capital : €{INITIAL_EUR:,.2f}")
     print(f"  Cycles / sim    : {NUM_CYCLES}  ({NUM_CYCLES * CYCLE_SECONDS / 3600:.1f}h bot run-time each)")
     print(f"  Pairs           : {', '.join(PAIR_NAMES)}")
-    print(f"  Strategy        : TP +{(TAKE_PROFIT-1)*100:.0f}%  |  SL -{(1-STOP_LOSS)*100:.0f}%  |  Trailing -{(1-TRAILING_STOP)*100:.0f}%")
+    print(f"  Strategy        : TP +3%  |  SL -1% (break-even after +1%)  |  Trailing -1% after +1.5%")
     print(f"  CPU cores       : {ncpus}")
     print(f"  Est. speed      : {rate_est * ncpus:>10,.0f} sims/s")
     print(f"  Est. ETA        : {eta_est:>6.1f}s  ({eta_est / 60:.1f} min)")
