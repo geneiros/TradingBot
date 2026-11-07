@@ -17,7 +17,8 @@ _BREAK_EVEN_TRIGGER = 1.01   # once peak >= +1%, stop rises to break-even (0%)
 _TRAILING_STOP = 0.99        # trailing stop: -1% from peak
 _PROXIMITY_MIN = 0.97        # price must be within ~3% above recent MA (pullback entry)
 _WINDOW_SECONDS = 43200  # 12-hour rolling window
-_MAX_MA_HISTORY = 200   # cap for MA lists
+_MAX_MA_HISTORY = 200   # cap for stored MA / candle lists
+_MA_WINDOW = 100        # candles per moving-average point
 
 _PAIRS = ('XETHZEUR', 'XXBTZEUR', 'MANAEUR', 'GRTEUR', 'LSKEUR', 'SCEUR')
 
@@ -195,20 +196,25 @@ def bot(k_api, pairs):
 
 
 def check_data(name, crypto_data, should_buy, mva):
+    window = crypto_data[-_MA_WINDOW:]
+    if not window:
+        print(f'[{name}] no OHLC data returned, skipping')
+        return
     high = 0
     low = 0
     close = 0
-    for b in crypto_data[-100:]:
+    for b in window:
         if b not in mva[name]['prices']:
             mva[name]['prices'].append(b)
         high  += float(b[_OHLC_HIGH])
         low   += float(b[_OHLC_LOW])
         close += float(b[_OHLC_CLOSE])
-    mva[name]['high'].append(high / 100)
-    mva[name]['low'].append(low / 100)
-    mva[name]['close'].append(close / 100)
-    # Cap MA lists to prevent unbounded growth
-    for key in ('high', 'low', 'close'):
+    n = len(window)
+    mva[name]['high'].append(high / n)
+    mva[name]['low'].append(low / n)
+    mva[name]['close'].append(close / n)
+    # Cap stored lists to prevent unbounded growth of data.json
+    for key in ('high', 'low', 'close', 'prices'):
         if len(mva[name][key]) > _MAX_MA_HISTORY:
             mva[name][key] = mva[name][key][-_MAX_MA_HISTORY:]
     # Track real peak price while holding a position

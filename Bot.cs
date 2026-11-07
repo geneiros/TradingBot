@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -5,16 +6,29 @@ using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 
 // ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+Bot.InitFiles();
+var krakenClient = new KrakenClient();
+krakenClient.LoadKey("kraken.key");
+await new Bot(krakenClient).RunAsync(Config.Pairs);
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 static class Config
 {
+    public const int    OhlcOpen       = 1;
     public const int    OhlcHigh       = 2;
     public const int    OhlcLow        = 3;
     public const int    OhlcClose      = 4;
-    public const double ProfitTarget   = 1.05;  // take profit at +5%
-    public const double StopLoss       = 0.99;  // stop-loss at -1%
-    public const double TrailingStop   = 0.99;  // trailing stop: -1% from peak MA
+    public const double ProfitTarget     = 1.03;  // take profit at +3%
+    public const double StopLoss         = 0.99;  // initial stop-loss at -1%
+    public const double BreakEvenTrigger = 1.01;  // once peak >= +1%, stop rises to break-even (0%)
+    public const double TrailingStop     = 0.99;  // trailing stop: -1% from peak
+    public const double TrailingTrigger  = 1.015; // trailing stop active once peak > +1.5%
+    public const double ProximityMin     = 0.97;  // price within ~3% above recent MA (pullback entry)
+    public const int    MinUptrendCount  = 5;     // consecutive MA up-moves required to buy
     public const int    WindowSeconds  = 43200; // 12-hour rolling window
     public const int    MaxMaHistory   = 200;   // cap for MA lists
 
@@ -40,6 +54,7 @@ class PairData
     [JsonPropertyName("low")]    public List<double>       Low    { get; set; } = [];
     [JsonPropertyName("close")]  public List<double>       Close  { get; set; } = [];
     [JsonPropertyName("prices")] public List<List<string>> Prices { get; set; } = [];
+    [JsonPropertyName("peak_price")] public double         PeakPrice { get; set; }
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +218,7 @@ class Bot(KrakenClient kraken)
     {
         var balance = await GetBalanceAsync();
         balance.TryGetValue("ZEUR", out var zusdStr);
-        double money = double.TryParse(zusdStr, out var m) ? m : 0.0;
+        double money = double.TryParse(zusdStr, NumberStyles.Float, CultureInfo.InvariantCulture, out var m) ? m : 0.0;
 
         var trades    = LoadTrades();
         int pairsHeld = Config.Pairs.Count(p =>
@@ -222,7 +237,7 @@ class Bot(KrakenClient kraken)
             ["pair"]      = pair,
             ["type"]      = orderType,
             ["ordertype"] = "market",
-            ["volume"]    = volume.ToString("F8"),
+            ["volume"]    = volume.ToString("F8", CultureInfo.InvariantCulture),
         });
         var errors = resp["error"]?.AsArray();
         if (errors is { Count: > 0 })
@@ -234,6 +249,9 @@ class Bot(KrakenClient kraken)
         return true;
     }
 
+    private static double ParseNum(string s) =>
+        double.Parse(s, NumberStyles.Float, CultureInfo.InvariantCulture);
+
     private static string Capitalize(string s) =>
         s.Length == 0 ? s : char.ToUpper(s[0]) + s[1..];
 
@@ -242,7 +260,7 @@ class Bot(KrakenClient kraken)
     public async Task BuyCryptoAsync(List<List<string>> cryptoData, string name)
     {
         ClearCryptoData(name);
-        double price = double.Parse(cryptoData[^1][Config.OhlcClose]);
+        double price = ParseNum(cryptoData[^1][Config.OhlcClose]);
         double funds = await GetAvailableFundsAsync();
         if (funds <= 0)
         {
@@ -257,7 +275,7 @@ class Bot(KrakenClient kraken)
     public async Task SellCryptoAsync(List<List<string>> cryptoData, string name)
     {
         ClearCryptoData(name);
-        double price   = double.Parse(cryptoData[^1][Config.OhlcClose]);
+        double price   = ParseNum(cryptoData[^1][Config.OhlcClose]);
         var    trades  = LoadTrades();
         var    lastBuy = trades[name].LastOrDefault(t => t.Bought);
         if (lastBuy is null)
@@ -279,6 +297,7 @@ class Bot(KrakenClient kraken)
         pd.Low    = [.. pd.Low.TakeLast(10)];
         pd.Close  = [.. pd.Close.TakeLast(10)];
         pd.Prices = [.. pd.Prices.TakeLast(10)];
+        pd.PeakPrice = 0.0; // reset on buy/sell
         SaveCryptoData(data);
         return data;
     }
@@ -299,9 +318,9 @@ class Bot(KrakenClient kraken)
         {
             if (!pd.Prices.Any(p => p.SequenceEqual(b)))
                 pd.Prices.Add(b);
-            high  += double.Parse(b[Config.OhlcHigh]);
-            low   += double.Parse(b[Config.OhlcLow]);
-            close += double.Parse(b[Config.OhlcClose]);
+            high  += ParseNum(b[Config.OhlcHigh]);
+            low   += ParseNum(b[Config.OhlcLow]);
+            close += ParseNum(b[Config.OhlcClose]);
         }
         pd.High.Add(high  / 100);
         pd.Low.Add(low    / 100);
@@ -311,6 +330,13 @@ class Bot(KrakenClient kraken)
         if (pd.High.Count  > Config.MaxMaHistory) pd.High  = [.. pd.High.TakeLast(Config.MaxMaHistory)];
         if (pd.Low.Count   > Config.MaxMaHistory) pd.Low   = [.. pd.Low.TakeLast(Config.MaxMaHistory)];
         if (pd.Close.Count > Config.MaxMaHistory) pd.Close = [.. pd.Close.TakeLast(Config.MaxMaHistory)];
+
+        // Track real peak price while holding a position
+        if (!shouldBuy)
+        {
+            double currentPrice = ParseNum(cryptoData[^1][Config.OhlcClose]);
+            if (currentPrice > pd.PeakPrice) pd.PeakPrice = currentPrice;
+        }
 
         SaveCryptoData(mva);
 
@@ -322,7 +348,8 @@ class Bot(KrakenClient kraken)
 
     public async Task TryBuyAsync(PairData data, string name, List<List<string>> cryptoData)
     {
-        if (CheckOpportunity(data, name, sell: false, buy: true) == true)
+        Console.WriteLine($"[{name}] BUY mode  | price={ParseNum(cryptoData[^1][Config.OhlcClose]):F8}");
+        if (CheckOpportunity(data, name, cryptoData, sell: false, buy: true) == true)
         {
             Console.WriteLine("Buy Crypto " + name);
             await BuyCryptoAsync(cryptoData, name);
@@ -331,7 +358,7 @@ class Bot(KrakenClient kraken)
 
     public async Task TrySellAsync(PairData data, string name, List<List<string>> cryptoData)
     {
-        if (CheckOpportunity(data, name, sell: true, buy: false) == true)
+        if (CheckOpportunity(data, name, cryptoData, sell: true, buy: false) == true)
         {
             Console.WriteLine("Sell Crypto " + name);
             await SellCryptoAsync(cryptoData, name);
@@ -341,7 +368,8 @@ class Bot(KrakenClient kraken)
     // Returns true  → act on the signal
     //         false → no signal (buy path only)
     //         null  → no signal (sell path, no exit conditions met)
-    public bool? CheckOpportunity(PairData data, string name, bool sell, bool buy)
+    public bool? CheckOpportunity(
+        PairData data, string name, List<List<string>> cryptoData, bool sell, bool buy)
     {
         int    count         = 0;
         double previousValue = 0;
@@ -362,27 +390,38 @@ class Bot(KrakenClient kraken)
             }
         }
 
-        if (data.Prices.Count == 0) return buy ? false : null;
-        double price = double.Parse(data.Prices[^1][Config.OhlcClose]);
+        if (cryptoData.Count == 0) return buy ? false : null;
+        double price = ParseNum(cryptoData[^1][Config.OhlcClose]); // always use live price
 
         if (sell)
         {
             double purchasePrice = GetPurchasingPrice(name);
-            double peakMa        = data.Close.Count > 0 ? data.Close.Max() : purchasePrice;
+            double peakPrice     = data.PeakPrice;
+            double profitPct     = (price / purchasePrice - 1) * 100;
+            Console.WriteLine($"[{name}] SELL mode | price={price:F8} buy={purchasePrice:F8} profit={profitPct:+0.0000;-0.0000}% | peak={peakPrice:F8}");
 
             if (price >= purchasePrice * Config.ProfitTarget)
             {
-                Console.WriteLine($"Taking profit (+{(int)((Config.ProfitTarget - 1) * 100)}%)");
+                Console.WriteLine("Taking profit at +3% → SELL");
                 return true;
             }
-            if (price < purchasePrice * Config.StopLoss)
+            // Break-even stop: once peak hit +1%, floor the stop at entry price
+            if (peakPrice >= purchasePrice * Config.BreakEvenTrigger)
+            {
+                if (price < purchasePrice)
+                {
+                    Console.WriteLine("Break-even stop triggered (peak reached +1%) → SELL");
+                    return true;
+                }
+            }
+            else if (price < purchasePrice * Config.StopLoss)
             {
                 Console.WriteLine("Stop-loss triggered (-1%)");
                 return true;
             }
-            if (price < peakMa * Config.TrailingStop)
+            if (peakPrice > purchasePrice * Config.TrailingTrigger && price < peakPrice * Config.TrailingStop)
             {
-                Console.WriteLine("Trailing stop triggered (-1% from peak MA)");
+                Console.WriteLine($"Trailing stop triggered (-1% from peak {peakPrice:F8})");
                 return true;
             }
             return null;
@@ -390,11 +429,16 @@ class Bot(KrakenClient kraken)
 
         if (buy)
         {
-            if (count >= 5)
+            if (count >= Config.MinUptrendCount)
             {
-                var areas = data.Close.TakeLast(5).Reverse().Select(mva => mva / price).ToList();
-                if (areas.Count > 0 && areas.Average() >= 0.93)
-                    return true;
+                var areas = data.Close.TakeLast(5).Select(mva => mva / price).ToList();
+                if (areas.Count > 0 && areas.Average() >= Config.ProximityMin)
+                {
+                    // Only enter if the current candle is bullish (close >= open)
+                    double candleOpen = ParseNum(cryptoData[^1][Config.OhlcOpen]);
+                    if (price >= candleOpen)
+                        return true;
+                }
             }
             return false;
         }
@@ -457,11 +501,3 @@ class Bot(KrakenClient kraken)
         catch (IOException) { }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
-Bot.InitFiles();
-var krakenClient = new KrakenClient();
-krakenClient.LoadKey("kraken.key");
-await new Bot(krakenClient).RunAsync(Config.Pairs);

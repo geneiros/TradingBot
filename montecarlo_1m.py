@@ -3,7 +3,7 @@
 Monte Carlo simulation — 1,000,000 runs, $1,000 initial capital.
 
 Fully in-memory (zero file I/O), multiprocessing across all CPU cores.
-Replicates bot.py strategy exactly: TP +3% | SL -1% | Trailing -2%
+Mirrors bot.py: TP +3% | SL -1% → break-even at +1% | trailing -1% after +1.5%
 """
 
 import random
@@ -12,16 +12,18 @@ import sys
 from multiprocessing import Pool, cpu_count
 
 # ── Strategy (mirrors bot.py) ─────────────────────────────────────────────────
-TAKE_PROFIT    = 1.05
-STOP_LOSS      = 0.99
-TRAILING_STOP  = 0.99
-MA_THRESHOLD   = 0.93
+TAKE_PROFIT      = 1.03    # sell at +3%
+STOP_LOSS        = 0.99    # initial stop at -1%
+BREAK_EVEN       = 1.01    # once peak >= +1%, stop rises to entry (0%)
+TRAILING_STOP    = 0.99    # sell if price < peak * 0.99 ...
+TRAILING_TRIGGER = 1.015   # ... once peak > entry * 1.015
+MA_THRESHOLD     = 0.97    # avg(MA[-5:]) / price must be >= this
 MA_UPTREND_MIN = 5
 
 # ── Simulation config ─────────────────────────────────────────────────────────
 NUM_SIMULATIONS = 1_000_000
 NUM_CYCLES      = 20
-INITIAL_USD     = 100.0
+INITIAL_USD     = 1_000.0
 NUM_PAIRS       = 6
 BATCH_SIZE      = 2_000          # simulations per worker batch
 
@@ -56,7 +58,7 @@ def _simulate_one(seed):
 
     # Portfolio state
     usd      = INITIAL_USD
-    holdings = [None] * NUM_PAIRS   # None  or  (qty, buy_price)
+    holdings = [None] * NUM_PAIRS   # None  or  (qty, buy_price, peak_price)
     ma_hist  = [[]   for _ in range(NUM_PAIRS)]
 
     for cycle in range(NUM_CYCLES):
@@ -92,25 +94,33 @@ def _simulate_one(seed):
                 avg_ratio = sum(mv / cur for mv in last5) / 5
                 if avg_ratio < MA_THRESHOLD:
                     continue
+                # bullish candle confirmation (open ≈ previous close)
+                if cur < window[-2]:
+                    continue
 
                 # Execute buy
                 n_free = NUM_PAIRS - sum(1 for h in holdings if h is not None)
                 if n_free > 0 and usd > 0.0:
                     funds       = usd / n_free
                     usd        -= funds
-                    holdings[i] = (funds / cur, cur)
+                    holdings[i] = (funds / cur, cur, cur)
                     ma_hist[i]  = mh[-10:]          # trim (clear_crypto_data)
 
             else:
                 # ── SELL check ───────────────────────────────────────────────
-                qty, buy_price = holdings[i]
+                qty, buy_price, peak = holdings[i]
                 mh   = ma_hist[i]
-                peak = max(mh) if mh else buy_price
-
-                if   cur >= buy_price * TAKE_PROFIT:   sell = True
-                elif cur <  buy_price * STOP_LOSS:     sell = True
-                elif cur <  peak      * TRAILING_STOP: sell = True
-                else:                                   sell = False
+                peak = max(peak, cur)
+                holdings[i] = (qty, buy_price, peak)
+                if cur >= buy_price * TAKE_PROFIT:
+                    sell = True
+                elif peak >= buy_price * BREAK_EVEN:
+                    sell = cur < buy_price          # break-even stop
+                else:
+                    sell = cur < buy_price * STOP_LOSS
+                if (not sell and peak > buy_price * TRAILING_TRIGGER
+                        and cur < peak * TRAILING_STOP):
+                    sell = True
 
                 if sell:
                     usd        += qty * cur
@@ -146,8 +156,7 @@ if __name__ == '__main__':
     print(f"  MONTE CARLO — 1,000,000 SIMULAÇÕES")
     print(f"  Capital inicial : ${INITIAL_USD:,.2f}")
     print(f"  Ciclos/sim      : {NUM_CYCLES}  |  Pares : {NUM_PAIRS}")
-    print(f"  Estratégia      : TP +{(TAKE_PROFIT-1)*100:.0f}%  |"
-          f"  SL -{(1-STOP_LOSS)*100:.0f}%  |  Trailing -{(1-TRAILING_STOP)*100:.0f}%")
+    print(f"  Estratégia      : TP +3%  |  SL -1% (break-even após +1%)  |  Trailing -1% após +1.5%")
     print(f"  CPU cores       : {ncpus}")
     print(f"  Velocidade est. : {rate_est*ncpus:>10,.0f} sims/s")
     print(f"  ETA estimado    : {eta_est:>6.1f}s ({eta_est/60:.1f} min)")

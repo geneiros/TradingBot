@@ -6,8 +6,10 @@ BOTH strategies are run on the SAME price paths (identical RNG state)
 per chunk for a genuine apples-to-apples comparison.
 
 Strategy A — bot.py
-  Buy : 5 consecutive 1-min MA100 up-moves AND avg(MA100[-5:]) / price >= 0.93
-  Sell: +3% profit target  |  -1% stop-loss  |  trailing stop (−1% from peak after +1.5%)
+  Buy : 5 consecutive 1-min MA100 up-moves AND avg(MA100[-5:]) / price >= 0.97
+        AND bullish candle (price >= previous close)
+  Sell: +3% profit target  |  -1% stop-loss, raised to break-even once peak >= +1%
+        |  trailing stop (−1% from peak after +1.5%)
 
 Strategy B — sma_crossover_bot.py
   Buy : SMA20 crosses above SMA50 (golden cross)
@@ -39,6 +41,8 @@ SIGMA = float(np.mean([v / np.sqrt(MINUTES_PER_YEAR) for v in ANNUAL_VOLS]))
 # bot.py
 BOT_PROFIT_TARGET = 1.03
 BOT_STOP_LOSS     = 0.99
+BOT_BREAK_EVEN    = 1.01    # once peak >= entry * 1.01, stop rises to entry
+BOT_PROXIMITY     = 0.97    # avg(MA100[-5:]) / price >= this
 BOT_TRAIL_THRESH  = 0.99    # trailing stop: -1% from peak MA
 BOT_TRAIL_ACT     = 1.015   # trailing activates when peak > entry * 1.015
 
@@ -75,7 +79,8 @@ def precompute_bot_signals(prices: np.ndarray):
 
     Signal fires when:
       1. last 5 consecutive 1-min MA100 values are strictly rising  (count >= 5)
-      2. avg(MA100[-5:]) / price >= 0.93  (price near MA)
+      2. avg(MA100[-5:]) / price >= 0.97  (price near MA)
+      3. bullish candle: price[t] >= price[t-1]
     """
     # MA100[n, i] = mean(prices[n, i : i+100]), valid at price time t = i+99
     ma100 = rolling_mean(prices, 100)          # (N, T-99)
@@ -93,9 +98,10 @@ def precompute_bot_signals(prices: np.ndarray):
     #   consec5 index  = j          → t = j+104
     #   avg_ma5 index  = j+1        → t = j+104  (offset +1 because avg_ma5 starts at t=103)
     L = consec5.shape[1]            # = T - 104
-    prox = avg_ma5[:, 1:1 + L] / prices[:, 104:104 + L] >= 0.93
+    prox = avg_ma5[:, 1:1 + L] / prices[:, 104:104 + L] >= BOT_PROXIMITY
+    bullish = prices[:, 104:104 + L] >= prices[:, 103:103 + L]
 
-    buy_sig = consec5 & prox        # (N, T-104), index j → price time t = j+104
+    buy_sig = consec5 & prox & bullish       # (N, T-104), index j → price time t = j+104
     return buy_sig, 104
 
 
@@ -147,6 +153,10 @@ def simulate_chunk(prices: np.ndarray, strategy: str):
     for t in range(T_START, T):
         p = prices[:, t].astype(np.float64)
 
+        # ── Update peak with the live price (bot.py does this before checks)
+        if strategy == 'bot' and position.any():
+            peak_p[position] = np.maximum(peak_p[position], p[position])
+
         # ── Compute signals ──────────────────────────────────────────────
         if strategy == 'bot':
             j = t - 104
@@ -156,7 +166,9 @@ def simulate_chunk(prices: np.ndarray, strategy: str):
                 can_buy = np.zeros(N, dtype=bool)
 
             take_profit = position & (p >= entry_p * BOT_PROFIT_TARGET)
-            hard_stop   = position & (p <  entry_p * BOT_STOP_LOSS)
+            be_armed    = peak_p >= entry_p * BOT_BREAK_EVEN
+            hard_stop   = position & np.where(be_armed, p < entry_p,
+                                              p < entry_p * BOT_STOP_LOSS)
             trail_stop  = (position
                            & (peak_p > entry_p * BOT_TRAIL_ACT)
                            & (p < peak_p * BOT_TRAIL_THRESH))
@@ -189,10 +201,6 @@ def simulate_chunk(prices: np.ndarray, strategy: str):
             entry_p[can_buy]  = p[can_buy]
             peak_p[can_buy]   = p[can_buy]
             position[can_buy] = True
-
-        # ── Update peak (bot.py trailing stop tracking) ──────────────────
-        if strategy == 'bot' and position.any():
-            peak_p[position] = np.maximum(peak_p[position], p[position])
 
     # Close any open positions at end of week (mark-to-market)
     if position.any():
