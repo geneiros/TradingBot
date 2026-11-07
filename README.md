@@ -57,6 +57,7 @@ TradingBot/
 │
 ├── test_bot.py            # Testes unitários do bot.py (unittest + mocks)
 ├── simulate.py            # Simulação do bot.py com dados OHLC sintéticos
+├── sim_kraken.py          # Kraken simulado (em memória) usado pelas simulações
 ├── update_data.py         # Preenche data.json com ~2 meses de histórico da Kraken
 │
 ├── montecarlo*.py         # Simulações Monte Carlo de diferentes variantes
@@ -67,7 +68,7 @@ TradingBot/
 ├── data.json              # Estado: histórico de médias móveis por par
 ├── trades.json            # Estado: histórico de compras/vendas por par
 ├── balance.json           # Saldo fictício usado pelo bot_sim.py
-├── kraken.key             # Credenciais da API Kraken (NÃO partilhar)
+├── kraken.key             # Credenciais da API Kraken (criar localmente; ignorado pelo git)
 └── Resources/             # Documentação de referência (Turtle Trading System)
 ```
 
@@ -98,9 +99,8 @@ no formato esperado pelo `krakenex`:
 A chave deve ter permissões para **consultar saldos** e **criar ordens**.
 Não dê permissão de levantamento (*withdraw*).
 
-> 🔒 Este ficheiro contém segredos. Não o envie para repositórios públicos —
-> considere adicioná-lo ao `.gitignore` e revogar/rodar a chave caso já tenha
-> sido publicada.
+> 🔒 Este ficheiro contém segredos e está no `.gitignore` (tal como `*.key`).
+> Nunca o adicione ao repositório.
 
 ### Executar
 
@@ -194,7 +194,7 @@ com médias simples de 20 e 50 velas de 1 minuto:
 | Script                  | Ciclo | Ficheiros de estado                         |
 |-------------------------|-------|---------------------------------------------|
 | `bot2.py`               | 60 s  | `trades2.json`                              |
-| `sma_crossover_bot.py`  | —     | `sma_state.json`, `sma_trades.json`         |
+| `sma_crossover_bot.py`  | 20 s  | `sma_state.json`, `sma_trades.json`         |
 
 Como usam ficheiros próprios, podem correr em paralelo com `bot.py` sem
 conflitos de estado (mas partilham o mesmo saldo na conta Kraken).
@@ -236,12 +236,11 @@ Nenhum destes scripts envia ordens reais.
 | Script                 | Descrição |
 |------------------------|-----------|
 | `test_bot.py`          | Testes unitários do `bot.py` com a API da Kraken simulada (`python -m unittest test_bot`). |
-| `simulate.py`          | Corre a lógica do `bot.py` sobre velas sintéticas numa pasta temporária. |
+| `simulate.py`          | Executa o código real do `bot.py` contra um Kraken simulado (`sim_kraken.py`) com velas sintéticas; argumentos opcionais `[ciclos] [seed]`. |
 | `montecarlo.py`        | Monte Carlo de 1 semana com volatilidade calibrada por par; compara variantes de trailing stop. |
-| `montecarlo_1m.py`     | 1 000 000 simulações em memória, multiprocessamento. |
+| `montecarlo_1m.py`     | 1 000 000 simulações em memória (reimplementação rápida da estratégia), multiprocessamento. |
 | `montecarlo_eur.py`    | 1 000 000 simulações com €100; mede quantos ciclos até ao primeiro lucro. |
-| `montecarlo_3to1.py`   | Testa a relação risco/recompensa 3:1 (TP +3% / SL −1%). |
-| `montecarlo_value.py`  | Distribuição do valor final da carteira em 1000 simulações. |
+| `montecarlo_value.py`  | Distribuição do valor final da carteira, executando o código real do `bot.py` com comissão de 0.26%; argumentos opcionais `[simulações] [ciclos]`. |
 | `optimize.py`          | *Grid search* de take profit, stop-loss, trailing, etc., ordenado por valor esperado, taxa de acerto e Sharpe. |
 | `stop_loss_study.py`   | Estudo que levou ao stop de break-even a +1%. |
 | `compare_bots.py`      | Compara `bot.py`, `sma_crossover_bot.py` e *buy & hold* nos mesmos caminhos de preço. |
@@ -257,8 +256,11 @@ python simulate.py
 python compare_bots.py
 ```
 
-> Alguns scripts de simulação mantêm cópias próprias dos parâmetros e podem
-> não refletir exatamente os valores atuais de `bot.py`.
+> `simulate.py` e `montecarlo_value.py` usam diretamente o `bot.py`. Os
+> restantes scripts reimplementam a estratégia (para correrem milhões de
+> simulações) com parâmetros copiados do `bot.py`: se alterar as constantes do
+> bot, atualize-as também nesses scripts. `optimize.py` e `stop_loss_study.py`
+> testam de propósito várias combinações de parâmetros.
 
 ---
 
@@ -266,8 +268,9 @@ python compare_bots.py
 
 `Bot.cs` é um port da estratégia para .NET 8 que fala diretamente com a API
 REST da Kraken (assinatura HMAC-SHA512 própria) e usa os mesmos ficheiros
-`kraken.key`, `data.json` e `trades.json`. Os seus parâmetros (por exemplo,
-take profit a +5%) correspondem a uma versão anterior do `bot.py`.
+`kraken.key`, `data.json` e `trades.json`. Implementa as mesmas regras de
+compra e venda e os mesmos parâmetros do `bot.py` (take profit +3%, stop −1%
+com break-even a +1%, trailing stop, proximidade 0.97 e vela de confirmação).
 
 ```bash
 dotnet run
@@ -277,4 +280,4 @@ dotnet run
 
 ## Licença
 
-Distribuído sob a [Apache License 2.0](LICENSE).
+Distribuído sob a [licença MIT](LICENSE).
