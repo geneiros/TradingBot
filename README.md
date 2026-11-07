@@ -283,7 +283,7 @@ dotnet run
 
 ## Apoiar o projeto
 
-Se este projeto lhe for útil, pode apoiar o desenvolvimento com um café ☕:
+Se gostarem do projeto, just buy me a coffee 🙂
 
 <a href="https://buymeacoffee.com/geneiros"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black" alt="Buy Me a Coffee"></a>
 
